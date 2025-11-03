@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-COMPLETE MARKET MONITOR - v9.1 (TRADINGVIEW CLEAN EDITION)
-- CLEAN CHARTS: TradingView-style clear charts without technical indicators
-- ENHANCED: Improved data fetching with retry mechanisms
-- COMPREHENSIVE: Complete option chain data with all metrics
-- OPTIMIZED: Better performance and reliability
+OPTION CHAIN + CHART MONITOR v1.0
+===================================
+✅ Every 5 minutes scan
+✅ 21 ATM Strikes (OI, Volume, LTP)
+✅ 15M Candlestick Chart (Last 400 candles)
+✅ Clean PNG Chart Format
+✅ Telegram Alerts with Option Chain Table
 """
 
 import os
@@ -20,676 +22,666 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import pandas as pd
-import numpy as np
-import io
-from typing import Dict, List, Optional, Tuple
+import logging
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+import traceback
 
-# CONFIG
-UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-BASE_URL = "https://api.upstox.com"
+# ==================== CONFIGURATION ====================
 IST = pytz.timezone('Asia/Kolkata')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), logging.FileHandler('option_monitor.log')]
+)
+logger = logging.getLogger(__name__)
 
-# INDICES - ALL 4
+# API Keys
+UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+BASE_URL = "https://api.upstox.com"
+SCAN_INTERVAL = 300  # 5 minutes
+
+# ==================== SYMBOLS ====================
 INDICES = {
-    "NSE_INDEX|Nifty 50": {"name": "NIFTY 50", "expiry_day": 1},
-    "NSE_INDEX|Nifty Bank": {"name": "BANK NIFTY", "expiry_day": 2},
-    "NSE_INDEX|Nifty Fin Service": {"name": "FIN NIFTY", "expiry_day": 1},
-    "NSE_INDEX|NIFTY MID SELECT": {"name": "MIDCAP NIFTY", "expiry_day": 0}
+    "NSE_INDEX|Nifty 50": {"name": "NIFTY", "display_name": "NIFTY 50", "expiry_day": 3},
+    "NSE_INDEX|Nifty Bank": {"name": "BANKNIFTY", "display_name": "BANK NIFTY", "expiry_day": 2},
+    "NSE_INDEX|NIFTY MID SELECT": {"name": "MIDCPNIFTY", "display_name": "MIDCAP NIFTY", "expiry_day": 0}
 }
 
-# COMPLETE NIFTY 50 STOCKS
-NIFTY50_STOCKS = {
-    "NSE_EQ|INE002A01018": "RELIANCE", "NSE_EQ|INE467B01029": "TATAMOTORS",
-    "NSE_EQ|INE040A01034": "HDFCBANK", "NSE_EQ|INE090A01021": "ICICIBANK",
-    "NSE_EQ|INE062A01020": "SBIN", "NSE_EQ|INE009A01021": "INFY",
-    "NSE_EQ|INE854D01024": "TCS", "NSE_EQ|INE030A01027": "BHARTIARTL",
-    "NSE_EQ|INE238A01034": "AXISBANK", "NSE_EQ|INE237A01028": "KOTAKBANK",
-    "NSE_EQ|INE155A01022": "TATASTEEL", "NSE_EQ|INE047A01021": "HCLTECH",
-    "NSE_EQ|INE423A01024": "ADANIENT", "NSE_EQ|INE075A01022": "WIPRO",
-    "NSE_EQ|INE018A01030": "LT", "NSE_EQ|INE019A01038": "ASIANPAINT",
-    "NSE_EQ|INE585B01010": "MARUTI", "NSE_EQ|INE742F01042": "ADANIPORTS",
-    "NSE_EQ|INE001A01036": "ULTRACEMCO", "NSE_EQ|INE101A01026": "M&M",
-    "NSE_EQ|INE044A01036": "SUNPHARMA", "NSE_EQ|INE280A01028": "TITAN",
-    "NSE_EQ|INE669C01036": "TECHM", "NSE_EQ|INE522F01014": "COALINDIA",
-    "NSE_EQ|INE066F01012": "JSWSTEEL", "NSE_EQ|INE733E01010": "NTPC",
-    "NSE_EQ|INE752E01010": "POWERGRID", "NSE_EQ|INE239A01016": "NESTLEIND",
-    "NSE_EQ|INE296A01024": "BAJFINANCE", "NSE_EQ|INE213A01029": "ONGC",
-    "NSE_EQ|INE205A01025": "HINDALCO", "NSE_EQ|INE154A01025": "ITC",
-    "NSE_EQ|INE860A01027": "HDFCLIFE", "NSE_EQ|INE123W01016": "SBILIFE",
-    "NSE_EQ|INE114A01011": "EICHERMOT", "NSE_EQ|INE047A01021": "GRASIM",
-    "NSE_EQ|INE095A01012": "INDUSINDBK", "NSE_EQ|INE918I01018": "BAJAJFINSV",
-    "NSE_EQ|INE158A01026": "HEROMOTOCO", "NSE_EQ|INE361B01024": "DIVISLAB",
-    "NSE_EQ|INE059A01026": "CIPLA", "NSE_EQ|INE437A01024": "APOLLOHOSP",
-    "NSE_EQ|INE364U01010": "ADANIGREEN", "NSE_EQ|INE029A01011": "BPCL",
-    "NSE_EQ|INE216A01030": "BRITANNIA", "NSE_EQ|INE214T01019": "LTIM",
-    "NSE_EQ|INE849A01020": "TRENT", "NSE_EQ|INE721A01013": "SHRIRAMFIN",
-    "NSE_EQ|INE263A01024": "BEL", "NSE_EQ|INE511C01022": "POONAWALLA",
-    "NSE_EQ|INE594E01019": "HINDUNILVR",
+FO_STOCKS = {
+    "NSE_EQ|INE467B01029": {"name": "TATAMOTORS", "display_name": "TATA MOTORS"},
+    "NSE_EQ|INE585B01010": {"name": "MARUTI", "display_name": "MARUTI SUZUKI"},
+    "NSE_EQ|INE101A01026": {"name": "M&M", "display_name": "M&M"},
+    "NSE_EQ|INE917I01010": {"name": "BAJAJ-AUTO", "display_name": "BAJAJ AUTO"},
+    "NSE_EQ|INE040A01034": {"name": "HDFCBANK", "display_name": "HDFC BANK"},
+    "NSE_EQ|INE090A01021": {"name": "ICICIBANK", "display_name": "ICICI BANK"},
+    "NSE_EQ|INE062A01020": {"name": "SBIN", "display_name": "STATE BANK"},
+    "NSE_EQ|INE238A01034": {"name": "AXISBANK", "display_name": "AXIS BANK"},
+    "NSE_EQ|INE237A01028": {"name": "KOTAKBANK", "display_name": "KOTAK BANK"},
+    "NSE_EQ|INE009A01021": {"name": "INFY", "display_name": "INFOSYS"},
+    "NSE_EQ|INE854D01024": {"name": "TCS", "display_name": "TCS"},
+    "NSE_EQ|INE002A01018": {"name": "RELIANCE", "display_name": "RELIANCE"},
+    "NSE_EQ|INE397D01024": {"name": "BHARTIARTL", "display_name": "BHARTI AIRTEL"},
+    "NSE_EQ|INE296A01024": {"name": "BAJFINANCE", "display_name": "BAJAJ FINANCE"},
+    # ✅ NEW STOCKS ADDED
+    "NSE_EQ|INE019A01038": {"name": "ASIANPAINT", "display_name": "ASIAN PAINTS"},
+    "NSE_EQ|INE769A01020": {"name": "ATUL", "display_name": "ATUL LTD"},
+    "NSE_EQ|INE917I01010": {"name": "AUROPHARMA", "display_name": "AUROBINDO PHARMA"},
+    "NSE_EQ|INE917I01010": {"name": "DMART", "display_name": "AVENUE SUPERMARTS"},
+    "NSE_EQ|INE917I01010": {"name": "BANDHANBNK", "display_name": "BANDHAN BANK"},
+    "NSE_EQ|INE917I01010": {"name": "BANKBARODA", "display_name": "BANK OF BARODA"},
+    "NSE_EQ|INE917I01010": {"name": "BERGEPAINT", "display_name": "BERGER PAINTS"},
+    "NSE_EQ|INE917I01010": {"name": "BEL", "display_name": "BHARAT ELECTRONICS"},
+    "NSE_EQ|INE917I01010": {"name": "BPCL", "display_name": "BHARAT PETROLEUM"},
+    "NSE_EQ|INE917I01010": {"name": "BHARATFORG", "display_name": "BHARAT FORGE"},
+    "NSE_EQ|INE917I01010": {"name": "BHEL", "display_name": "BHEL"},
+    "NSE_EQ|INE917I01010": {"name": "BRITANNIA", "display_name": "BRITANNIA"},
+    "NSE_EQ|INE917I01010": {"name": "CANBK", "display_name": "CANARA BANK"},
+    "NSE_EQ|INE917I01010": {"name": "CHOLAFIN", "display_name": "CHOLAMANDALAM"},
+    "NSE_EQ|INE917I01010": {"name": "CIPLA", "display_name": "CIPLA"},
+    "NSE_EQ|INE917I01010": {"name": "COALINDIA", "display_name": "COAL INDIA"},
+    "NSE_EQ|INE917I01010": {"name": "COFORGE", "display_name": "COFORGE"},
+    "NSE_EQ|INE917I01010": {"name": "COLPAL", "display_name": "COLGATE"},
+    "NSE_EQ|INE917I01010": {"name": "DLF", "display_name": "DLF"},
+    "NSE_EQ|INE917I01010": {"name": "DABUR", "display_name": "DABUR"},
+    "NSE_EQ|INE917I01010": {"name": "DIVISLAB", "display_name": "DIVI'S LAB"},
+    "NSE_EQ|INE917I01010": {"name": "LICI", "display_name": "LIC INDIA"},
+    "NSE_EQ|INE917I01010": {"name": "DRREDDY", "display_name": "DR REDDY'S"},
+    "NSE_EQ|INE917I01010": {"name": "EICHERMOT", "display_name": "EICHER MOTORS"},
+    "NSE_EQ|INE917I01010": {"name": "GAIL", "display_name": "GAIL"},
+    "NSE_EQ|INE917I01010": {"name": "GRASIM", "display_name": "GRASIM"},
+    "NSE_EQ|INE917I01010": {"name": "HCLTECH", "display_name": "HCL TECH"},
+    "NSE_EQ|INE917I01010": {"name": "HDFCLIFE", "display_name": "HDFC LIFE"},
+    "NSE_EQ|INE917I01010": {"name": "HEROMOTOCO", {"name": "HEROMOTOCO", "display_name": "HERO MOTOCORP"},
+    "NSE_EQ|INE917I01010": {"name": "HINDALCO", "display_name": "HINDALCO"},
+    "NSE_EQ|INE917I01010": {"name": "HINDPETRO", "display_name": "HINDUSTAN PETRO"},
+    "NSE_EQ|INE917I01010": {"name": "HINDUNILVR", "display_name": "HINDUSTAN UNILEVER"},
+    "NSE_EQ|INE917I01010": {"name": "IBULHSGFIN", "display_name": "INDIABULLS HOUSING"},
+    "NSE_EQ|INE917I01010": {"name": "IDFCFIRSTB", "display_name": "IDFC FIRST BANK"},
+    "NSE_EQ|INE917I01010": {"name": "ITC", "display_name": "ITC"},
+    "NSE_EQ|INE917I01010": {"name": "INDHOTEL", "display_name": "INDIAN HOTELS"},
+    "NSE_EQ|INE917I01010": {"name": "INDUSINDBK", "display_name": "INDUSIND BANK"},
+    "NSE_EQ|INE917I01010": {"name": "NAUKRI", "display_name": "INFO EDGE"},
+    "NSE_EQ|INE917I01010": {"name": "IRCTC", "display_name": "IRCTC"},
+    "NSE_EQ|INE917I01010": {"name": "IGL", "display_name": "IGL"},
+    "NSE_EQ|INE917I01010": {"name": "INDUSTOWER", "display_name": "INDUS TOWERS"},
+    "NSE_EQ|INE917I01010": {"name": "JSWSTEEL", "display_name": "JSW STEEL"},
+    "NSE_EQ|INE917I01010": {"name": "JINDALSTEL", "display_name": "JINDAL STEEL"},
+    "NSE_EQ|INE917I01010": {"name": "LT", "display_name": "L&T"},
+    "NSE_EQ|INE917I01010": {"name": "LTIM", "display_name": "LTI MINDTREE"},
+    "NSE_EQ|INE917I01010": {"name": "LICHSGFIN", "display_name": "LIC HOUSING"},
+    "NSE_EQ|INE917I01010": {"name": "LUPIN", "display_name": "LUPIN"},
+    "NSE_EQ|INE917I01010": {"name": "MRF", "display_name": "MRF"},
+    "NSE_EQ|INE917I01010": {"name": "MPHASIS", "display_name": "MPHASIS"},
+    "NSE_EQ|INE917I01010": {"name": "MCX", "display_name": "MCX"},
+    "NSE_EQ|INE917I01010": {"name": "NTPC", "display_name": "NTPC"},
+    "NSE_EQ|INE917I01010": {"name": "NMDC", "display_name": "NMDC"},
+    "NSE_EQ|INE917I01010": {"name": "ONGC", "display_name": "ONGC"},
+    "NSE_EQ|INE917I01010": {"name": "OFSS", "display_name": "ORACLE FINANCIAL"},
+    "NSE_EQ|INE917I01010": {"name": "PAYTM", "display_name": "PAYTM"},
+    "NSE_EQ|INE917I01010": {"name": "PERSISTENT", "display_name": "PERSISTENT"},
+    "NSE_EQ|INE917I01010": {"name": "PIDILITIND", "display_name": "PIDILITE"},
+    "NSE_EQ|INE917I01010": {"name": "PFC", "display_name": "POWER FINANCE"},
+    "NSE_EQ|INE917I01010": {"name": "POWERGRID", "display_name": "POWER GRID"},
+    "NSE_EQ|INE917I01010": {"name": "PNB", "display_name": "PUNJAB NATIONAL BANK"},
+    "NSE_EQ|INE917I01010": {"name": "RECLTD", "display_name": "REC LIMITED"},
+    "NSE_EQ|INE917I01010": {"name": "SBICARD", "display_name": "SBI CARD"},
+    "NSE_EQ|INE917I01010": {"name": "SBILIFE", "display_name": "SBI LIFE"},
+    "NSE_EQ|INE917I01010": {"name": "SHREECEM", "display_name": "SHREE CEMENT"},
+    "NSE_EQ|INE917I01010": {"name": "SIEMENS", "display_name": "SIEMENS"},
+    "NSE_EQ|INE917I01010": {"name": "SUNPHARMA", "display_name": "SUN PHARMA"},
+    "NSE_EQ|INE917I01010": {"name": "TATACOMM", "display_name": "TATA COMM"},
+    "NSE_EQ|INE917I01010": {"name": "TATACONSUM", "display_name": "TATA CONSUMER"},
+    "NSE_EQ|INE917I01010": {"name": "TATAMTRDVR", "display_name": "TATA MOTORS DVR"},
+    "NSE_EQ|INE917I01010": {"name": "TATAPOWER", "display_name": "TATA POWER"},
+    "NSE_EQ|INE917I01010": {"name": "TATASTEEL", "display_name": "TATA STEEL"},
+    "NSE_EQ|INE917I01010": {"name": "TECHM", "display_name": "TECH MAHINDRA"},
+    "NSE_EQ|INE917I01010": {"name": "TITAN", "display_name": "TITAN"},
+    "NSE_EQ|INE917I01010": {"name": "TORNTPHARM", "display_name": "TORRENT PHARMA"},
+    "NSE_EQ|INE917I01010": {"name": "TRENT", "display_name": "TRENT"},
+    "NSE_EQ|INE917I01010": {"name": "ULTRACEMCO", "display_name": "ULTRATECH CEMENT"},
+    "NSE_EQ|INE917I01010": {"name": "MCDOWELL-N", "display_name": "UNITED SPIRITS"},
+    "NSE_EQ|INE917I01010": {"name": "UPL", "display_name": "UPL"},
+    "NSE_EQ|INE917I01010": {"name": "VBL", "display_name": "VARUN BEVERAGES"},
+    "NSE_EQ|INE917I01010": {"name": "VEDL", "display_name": "VEDANTA"},
+    "NSE_EQ|INE917I01010": {"name": "VOLTAS", "display_name": "VOLTAS"},
+    "NSE_EQ|INE917I01010": {"name": "WIPRO", "display_name": "WIPRO"},
+    "NSE_EQ|INE917I01010": {"name": "ZOMATO", "display_name": "ZOMATO"},
+    "NSE_EQ|INE917I01010": {"name": "ZYDUSLIFE", "display_name": "ZYDUS LIFESCIENCES"}
 }
 
-# Global tracking
-DAILY_STATS = {
-    "total_alerts": 0, 
-    "indices_count": 0, 
-    "stocks_count": 0, 
-    "start_time": None,
-    "api_calls": 0
-}
+ALL_SYMBOLS = {**INDICES, **FO_STOCKS}
 
-print("="*70)
-print("🚀 COMPLETE MARKET MONITOR - v9.1 (TRADINGVIEW CLEAN EDITION)")
-print("="*70)
+# ==================== DATA CLASSES ====================
+@dataclass
+class StrikeData:
+    strike: int
+    ce_oi: int
+    pe_oi: int
+    ce_volume: int
+    pe_volume: int
+    ce_ltp: float
+    pe_ltp: float
 
-def make_api_request(url: str, headers: dict, max_retries: int = 3, timeout: int = 15) -> Optional[dict]:
-    """Enhanced API request with retry mechanism and better error handling"""
-    for attempt in range(max_retries):
+# ==================== EXPIRY CALCULATOR ====================
+class ExpiryCalculator:
+    @staticmethod
+    def get_all_expiries_from_api(instrument_key: str) -> List[str]:
         try:
-            DAILY_STATS["api_calls"] += 1
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"
+            }
             
-            if resp.status_code == 200:
-                return resp.json()
-            elif resp.status_code == 429:  # Rate limited
-                wait_time = (2 ** attempt) * 2  # Exponential backoff
-                print(f"  ⚠️ Rate limited. Waiting {wait_time}s...")
-                time_sleep.sleep(wait_time)
-            else:
-                print(f"  ⚠️ API error {resp.status_code} on attempt {attempt + 1}")
-                if attempt < max_retries - 1:
-                    time_sleep.sleep(2)
+            encoded_key = urllib.parse.quote(instrument_key, safe='')
+            url = f"{BASE_URL}/v2/option/contract?instrument_key={encoded_key}"
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                contracts = response.json().get('data', [])
+                expiries = sorted(list(set(c['expiry'] for c in contracts if 'expiry' in c)))
+                return expiries
+            return []
+        except:
+            return []
+    
+    @staticmethod
+    def calculate_monthly_expiry(symbol_name: str, expiry_day: int = 3) -> str:
+        today = datetime.now(IST).date()
+        current_time = datetime.now(IST).time()
+        
+        last_day = (today.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        days_to_subtract = (last_day.weekday() - expiry_day) % 7
+        expiry = last_day - timedelta(days=days_to_subtract)
+        
+        if expiry < today or (expiry == today and current_time >= time(15, 30)):
+            next_month = (today.replace(day=28) + timedelta(days=4))
+            last_day = (next_month.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+            days_to_subtract = (last_day.weekday() - expiry_day) % 7
+            expiry = last_day - timedelta(days=days_to_subtract)
+        
+        return expiry.strftime('%Y-%m-%d')
+    
+    @staticmethod
+    def get_best_expiry(instrument_key: str, symbol_info: Dict) -> str:
+        expiry_day = symbol_info.get('expiry_day', 3)
+        
+        expiries = ExpiryCalculator.get_all_expiries_from_api(instrument_key)
+        
+        if expiries:
+            today = datetime.now(IST).date()
+            now_time = datetime.now(IST).time()
+            
+            future_expiries = []
+            for exp_str in expiries:
+                try:
+                    exp_date = datetime.strptime(exp_str, '%Y-%m-%d').date()
+                    if exp_date > today or (exp_date == today and now_time < time(15, 30)):
+                        future_expiries.append(exp_str)
+                except:
+                    continue
+            
+            if future_expiries:
+                return min(future_expiries)
+        
+        return ExpiryCalculator.calculate_monthly_expiry(symbol_info.get('name', ''), expiry_day)
+    
+    @staticmethod
+    def get_display_expiry(expiry_str: str) -> str:
+        try:
+            dt = datetime.strptime(expiry_str, '%Y-%m-%d')
+            return dt.strftime('%d%b%y').upper()
+        except:
+            return expiry_str
+
+# ==================== DATA FETCHER ====================
+class UpstoxDataFetcher:
+    def __init__(self):
+        self.headers = {
+            "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
+            "Accept": "application/json"
+        }
+    
+    def get_spot_price(self, instrument_key: str) -> float:
+        try:
+            encoded_key = urllib.parse.quote(instrument_key, safe='')
+            url = f"{BASE_URL}/v2/market-quote/ltp?instrument_key={encoded_key}"
+            
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json().get('data', {})
+                if data:
+                    ltp = list(data.values())[0].get('last_price', 0)
+                    return float(ltp)
+            return 0.0
+        except:
+            return 0.0
+    
+    def get_option_chain(self, instrument_key: str, expiry: str) -> List[StrikeData]:
+        """Fetch option chain with LTP"""
+        try:
+            encoded_key = urllib.parse.quote(instrument_key, safe='')
+            url = f"{BASE_URL}/v2/option/chain?instrument_key={encoded_key}&expiry_date={expiry}"
+            
+            response = requests.get(url, headers=self.headers, timeout=20)
+            
+            if response.status_code == 200:
+                data = response.json()
+                strikes_raw = data.get('data', [])
+                
+                strikes = []
+                for item in strikes_raw:
+                    call_data = item.get('call_options', {}).get('market_data', {})
+                    put_data = item.get('put_options', {}).get('market_data', {})
                     
-        except requests.exceptions.Timeout:
-            print(f"  ⚠️ Timeout on attempt {attempt + 1}")
-        except requests.exceptions.RequestException as e:
-            print(f"  ⚠️ Request error: {e} on attempt {attempt + 1}")
-        
-        if attempt < max_retries - 1:
-            time_sleep.sleep(1)
-    
-    print(f"  ❌ Failed after {max_retries} attempts")
-    return None
-
-def get_expiries(instrument_key: str) -> List[str]:
-    """Get available expiries with enhanced error handling"""
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
-    encoded_key = urllib.parse.quote(instrument_key, safe='')
-    url = f"{BASE_URL}/v2/option/contract?instrument_key={encoded_key}"
-    
-    data = make_api_request(url, headers)
-    if data and 'data' in data:
-        contracts = data['data']
-        expiries = sorted(list(set(c['expiry'] for c in contracts if 'expiry' in c)))
-        return expiries
-    
-    return []
-
-def get_next_expiry(instrument_key: str, expiry_day: int = 1) -> str:
-    """Get next expiry with fallback calculation"""
-    expiries = get_expiries(instrument_key)
-    
-    if not expiries:
-        today = datetime.now(IST)
-        days_ahead = expiry_day - today.weekday()
-        if days_ahead <= 0: 
-            days_ahead += 7
-        return (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
-    
-    today = datetime.now(IST).date()
-    future_expiries = [e for e in expiries if datetime.strptime(e, '%Y-%m-%d').date() >= today]
-    return min(future_expiries) if future_expiries else expiries[0]
-
-def get_option_chain(instrument_key: str, expiry: str) -> List[dict]:
-    """Get complete option chain data"""
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
-    encoded_key = urllib.parse.quote(instrument_key, safe='')
-    url = f"{BASE_URL}/v2/option/chain?instrument_key={encoded_key}&expiry_date={expiry}"
-    
-    data = make_api_request(url, headers, timeout=20)
-    if data and 'data' in data:
-        strikes = data['data']
-        return sorted(strikes, key=lambda x: x.get('strike_price', 0))
-    
-    return []
-
-def get_spot_price(instrument_key: str) -> float:
-    """Get spot price with enhanced reliability"""
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
-    encoded_key = urllib.parse.quote(instrument_key, safe='')
-    url = f"{BASE_URL}/v2/market-quote/quotes?instrument_key={encoded_key}"
-    
-    data = make_api_request(url, headers)
-    if data and 'data' in data:
-        quote_data = data['data']
-        if quote_data:
-            first_key = list(quote_data.keys())[0]
-            ltp = quote_data[first_key].get('last_price', 0)
-            if ltp:
-                return float(ltp)
-    
-    return 0.0
-
-def get_historical_data(instrument_key: str, symbol: str) -> Tuple[List, int]:
-    """Get combined historical and intraday data with improved processing"""
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
-    encoded_key = urllib.parse.quote(instrument_key, safe='')
-    
-    all_candles = []
-    
-    # Get historical data (15 days)
-    try:
-        to_date = (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
-        from_date = (datetime.now(IST) - timedelta(days=15)).strftime('%Y-%m-%d')
-        url = f"{BASE_URL}/v2/historical-candle/{encoded_key}/30minute/{to_date}/{from_date}"
-        
-        data = make_api_request(url, headers, timeout=20)
-        if data and data.get('status') == 'success':
-            for candle in data.get('data', {}).get('candles', []):
-                # Convert 30min to 5min candles
-                split_candles = split_30min_to_5min(candle)
-                all_candles.extend(split_candles)
-    except Exception as e:
-        print(f"  ⚠️ Historical data error for {symbol}: {e}")
-    
-    # Get intraday data
-    try:
-        url = f"{BASE_URL}/v2/historical-candle/intraday/{encoded_key}/1minute"
-        data = make_api_request(url, headers, timeout=20)
-        
-        if data and data.get('status') == 'success':
-            candles_1min = data.get('data', {}).get('candles', [])
-            if candles_1min:
-                # Convert to DataFrame for efficient resampling
-                df = pd.DataFrame(candles_1min, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'oi'])
-                df['ts'] = pd.to_datetime(df['ts'])
-                df = df.set_index('ts').astype(float)
+                    strikes.append(StrikeData(
+                        strike=int(item.get('strike_price', 0)),
+                        ce_oi=call_data.get('oi', 0),
+                        pe_oi=put_data.get('oi', 0),
+                        ce_volume=call_data.get('volume', 0),
+                        pe_volume=put_data.get('volume', 0),
+                        ce_ltp=call_data.get('ltp', 0),
+                        pe_ltp=put_data.get('ltp', 0)
+                    ))
                 
-                # Resample to 5 minutes
-                df_resampled = df.resample('5min').agg({
-                    'o': 'first', 'h': 'max', 'l': 'min', 
-                    'c': 'last', 'v': 'sum', 'oi': 'last'
-                }).dropna()
-                
-                # Convert back to list format
-                intraday_candles = [
-                    [idx.isoformat(), r['o'], r['h'], r['l'], r['c'], r['v'], r['oi']] 
-                    for idx, r in df_resampled.iterrows()
-                ]
-                all_candles.extend(intraday_candles)
-    except Exception as e:
-        print(f"  ⚠️ Intraday data error for {symbol}: {e}")
+                return strikes
+            return []
+        except Exception as e:
+            logger.error(f"Option chain error: {e}")
+            return []
     
-    # Sort all candles by timestamp
-    all_candles = sorted(all_candles, key=lambda x: x[0])
-    
-    # Count historical candles (before today)
-    today = datetime.now(IST).date()
-    hist_count = len([
-        c for c in all_candles 
-        if datetime.fromisoformat(c[0]).astimezone(IST).date() < today
-    ])
-    
-    return all_candles, hist_count
-
-def split_30min_to_5min(candle_30min: list) -> List[list]:
-    """Split 30-minute candle into 5-minute candles"""
-    try:
-        ts_str, o, h, l, c, v, oi = candle_30min
-        dt_start = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone(IST)
-        candles_5min = []
-        
-        for i in range(6):
-            c_time = dt_start + timedelta(minutes=i * 5)
-            # Linear interpolation for OHLC
-            progress = i / 6
-            c_open = o + (c - o) * progress
-            c_close = o + (c - o) * ((i + 1) / 6)
-            c_high = max(h, c_open, c_close)
-            c_low = min(l, c_open, c_close)
-            
-            candles_5min.append([
-                c_time.isoformat(), 
-                float(c_open), 
-                float(c_high), 
-                float(c_low), 
-                float(c_close), 
-                float(v) / 6, 
-                float(oi)
-            ])
-        return candles_5min
-    except Exception as e:
-        print(f"  ⚠️ Candle splitting error: {e}")
-        return []
-
-def create_tradingview_chart(candles: List[list], symbol: str, spot_price: float, hist_count: int) -> Optional[io.BytesIO]:
-    """Create clean TradingView-style chart without indicators"""
-    if not candles or len(candles) < 10:
-        return None
-    
-    # Convert to DataFrame
-    data = []
-    for c in candles:
+    def get_15m_data(self, instrument_key: str, candles_needed: int = 400) -> Optional[pd.DataFrame]:
+        """Fetch 15M candles - Last 400 candles"""
         try:
-            ts = datetime.fromisoformat(c[0].replace("Z", "+00:00")).astimezone(IST)
-            if time(9, 15) <= ts.time() <= time(15, 30):
-                data.append({
-                    'ts': ts, 'o': float(c[1]), 'h': float(c[2]), 
-                    'l': float(c[3]), 'c': float(c[4]), 'v': int(c[5])
-                })
-        except (ValueError, TypeError):
-            continue
-    
-    if not data:
-        return None
-    
-    df = pd.DataFrame(data)
-    
-    # Create clean figure
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(24, 12), 
-                                  gridspec_kw={'height_ratios': [3, 1]}, 
-                                  facecolor='#0e1217')
-    
-    # Set background colors
-    for ax in [ax1, ax2]:
-        ax.set_facecolor('#0e1217')
-        ax.tick_params(axis='both', colors='#b2b5be', labelsize=11)
-        ax.grid(True, alpha=0.2, color='#363a45')
-        for spine in ax.spines.values():
-            spine.set_color('#1e222d')
-    
-    # Plot clean candlesticks
-    x_positions = range(len(df))
-    for i, (idx, row) in enumerate(df.iterrows()):
-        color = '#26a69a' if row['c'] >= row['o'] else '#ef5350'
-        
-        # High-Low line (thin wick)
-        ax1.plot([i, i], [row['l'], row['h']], color=color, linewidth=0.8, zorder=1)
-        
-        # Open-Close body (thicker)
-        body_height = abs(row['c'] - row['o'])
-        body_bottom = min(row['o'], row['c'])
-        
-        if body_height > 0:
-            # Proper candlestick body
-            rect = Rectangle((i - 0.35, body_bottom), 0.7, body_height, 
-                           facecolor=color, alpha=1.0, zorder=2,
-                           edgecolor=color, linewidth=0.5)
-            ax1.add_patch(rect)
-        else:
-            # Doji - just a horizontal line
-            ax1.plot([i - 0.3, i + 0.3], [body_bottom, body_bottom], 
-                    color=color, linewidth=1.5, zorder=2)
-    
-    # Current spot price line
-    ax1.axhline(y=spot_price, color='#00e676', linestyle='--', 
-                linewidth=2.0, alpha=0.9, label=f'Spot: ₹{spot_price:.2f}')
-    
-    # Volume bars
-    for i, (idx, row) in enumerate(df.iterrows()):
-        color = '#26a69a' if row['c'] >= row['o'] else '#ef5350'
-        ax2.bar(i, row['v'], width=0.8, color=color, alpha=0.7)
-    
-    # Historical/intraday separator
-    if 0 < hist_count < len(df):
-        ax1.axvline(x=hist_count - 0.5, color='#ffa726', linestyle='--', 
-                   linewidth=2.0, alpha=0.8, label='Live Data Start')
-        ax2.axvline(x=hist_count - 0.5, color='#ffa726', linestyle='--', 
-                   linewidth=2.0, alpha=0.8)
-    
-    # Clean legends
-    ax1.legend(loc='upper left', fontsize=10, facecolor='#1e222d', 
-               edgecolor='#363a45', labelcolor='#b2b5be')
-    
-    # Professional titles and labels
-    ax1.set_title(
-        f'📊 {symbol} • TRADINGVIEW STYLE CHART • {datetime.now(IST).strftime("%d %b %Y • %I:%M:%S %p IST")}',
-        color='#ffffff', fontsize=16, fontweight='bold', pad=20
-    )
-    
-    ax1.set_ylabel('Price (₹)', color='#b2b5be', fontsize=12)
-    ax2.set_ylabel('Volume', color='#b2b5be', fontsize=12)
-    ax2.set_xlabel('Time (5min intervals)', color='#b2b5be', fontsize=12)
-    
-    # X-axis formatting
-    tick_positions = []
-    tick_labels = []
-    last_date = None
-    
-    for i, (idx, row) in enumerate(df.iterrows()):
-        current_date = row['ts'].strftime('%d-%m')
-        if current_date != last_date:
-            tick_positions.append(i)
-            tick_labels.append(row['ts'].strftime('%d %b\n%H:%M'))
-            last_date = current_date
-    
-    # Limit number of x-axis labels for cleanliness
-    if len(tick_positions) > 8:
-        step = max(1, len(tick_positions) // 6)
-        tick_positions = tick_positions[::step]
-        tick_labels = tick_labels[::step]
-    
-    for ax in [ax1, ax2]:
-        ax.set_xticks(tick_positions)
-        ax.set_xticklabels(tick_labels, color='#b2b5be', fontsize=10)
-        ax.set_xlim(0, len(df))
-    
-    # Adjust layout
-    plt.tight_layout(pad=3.0)
-    plt.subplots_adjust(hspace=0.08)
-    
-    # Save to buffer
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=120, facecolor='#0e1217', 
-                bbox_inches='tight', edgecolor='none')
-    buf.seek(0)
-    plt.close(fig)
-    
-    return buf
-
-def format_option_chain_message(symbol: str, spot: float, expiry: str, strikes: List[dict]) -> Optional[str]:
-    """Format comprehensive option chain data with all metrics"""
-    if not strikes:
-        return None
-    
-    # Find ATM strike
-    atm_strike = min(strikes, key=lambda x: abs(x.get('strike_price', 0) - spot))
-    atm_index = strikes.index(atm_strike)
-    
-    # Select strikes around ATM (7 on each side for comprehensive view)
-    start_idx = max(0, atm_index - 7)
-    end_idx = min(len(strikes), atm_index + 8)
-    selected = strikes[start_idx:end_idx]
-    
-    # Calculate comprehensive totals and metrics
-    total_ce_oi = total_pe_oi = total_ce_volume = total_pe_volume = 0
-    total_ce_oi_change = total_pe_oi_change = 0
-    max_pain_oi = 0
-    max_pain_strike = 0
-    
-    for strike in strikes:
-        sp = strike.get('strike_price', 0)
-        ce_data = strike.get('call_options', {}).get('market_data', {})
-        pe_data = strike.get('put_options', {}).get('market_data', {})
-        
-        ce_oi = ce_data.get('oi', 0)
-        pe_oi = pe_data.get('oi', 0)
-        
-        total_ce_oi += ce_oi
-        total_pe_oi += pe_oi
-        total_ce_volume += ce_data.get('volume', 0)
-        total_pe_volume += pe_data.get('volume', 0)
-        total_ce_oi_change += ce_data.get('oi_change', 0)
-        total_pe_oi_change += pe_data.get('oi_change', 0)
-        
-        # Calculate max pain (simplified)
-        strike_oi = ce_oi + pe_oi
-        if strike_oi > max_pain_oi:
-            max_pain_oi = strike_oi
-            max_pain_strike = sp
-    
-    # Build comprehensive message
-    msg = f"🎯 *{symbol} - COMPLETE OPTION CHAIN ANALYSIS*\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"*Spot Price:* `₹{spot:,.2f}`\n"
-    msg += f"*Expiry:* `{expiry}`\n"
-    msg += f"*ATM Strike:* `₹{atm_strike.get('strike_price', 0):,.0f}`\n"
-    msg += f"*Max Pain:* `₹{max_pain_strike:,.0f}`\n\n"
-    
-    # Comprehensive option chain table
-    msg += "```\n"
-    msg += "┌───────────── CALLS ─────────────┬────────── STRIKE ──────────┬───────────── PUTS ─────────────┐\n"
-    msg += "│    OI      Vol    Chg     LTP   │           Price            │   LTP    Chg     Vol      OI    │\n"
-    msg += "├─────────────────────────────────┼────────────────────────────┼─────────────────────────────────┤\n"
-    
-    for strike in selected:
-        sp = strike.get('strike_price', 0)
-        marker = "⚡" if sp == atm_strike.get('strike_price', 0) else "│"
-        
-        ce_data = strike.get('call_options', {}).get('market_data', {})
-        pe_data = strike.get('put_options', {}).get('market_data', {})
-        
-        # Call options data
-        ce_oi = fmt_val(ce_data.get('oi', 0))
-        ce_vol = fmt_val(ce_data.get('volume', 0))
-        ce_oi_chg = fmt_change(ce_data.get('oi_change', 0))
-        ce_ltp = f"{ce_data.get('ltp', 0):6.1f}"
-        
-        # Put options data
-        pe_oi = fmt_val(pe_data.get('oi', 0))
-        pe_vol = fmt_val(pe_data.get('volume', 0))
-        pe_oi_chg = fmt_change(pe_data.get('oi_change', 0))
-        pe_ltp = f"{pe_data.get('ltp', 0):6.1f}"
-        
-        msg += f"│ {ce_oi:>7} {ce_vol:>6} {ce_oi_chg:>5} {ce_ltp} │ {marker} ₹{sp:>8,.0f} {marker} │ {pe_ltp} {pe_oi_chg:>5} {pe_vol:>6} {pe_oi:>7} │\n"
-    
-    msg += "└─────────────────────────────────┴────────────────────────────┴─────────────────────────────────┘\n"
-    msg += "```\n\n"
-    
-    # Advanced market sentiment and statistics
-    pcr_oi = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
-    pcr_volume = total_pe_volume / total_ce_volume if total_ce_volume > 0 else 0
-    
-    # Determine comprehensive sentiment
-    if pcr_oi > 1.5:
-        pcr_oi_sentiment = "🟢 STRONG BULLISH"
-    elif pcr_oi > 1.2:
-        pcr_oi_sentiment = "🟢 BULLISH"
-    elif pcr_oi > 0.8:
-        pcr_oi_sentiment = "🟡 NEUTRAL"
-    elif pcr_oi > 0.5:
-        pcr_oi_sentiment = "🔴 BEARISH"
-    else:
-        pcr_oi_sentiment = "🔴 STRONG BEARISH"
-    
-    # OI change sentiment
-    oi_change_sentiment = ""
-    if total_ce_oi_change > 0 and total_pe_oi_change > 0:
-        oi_change_sentiment = "📈 Both CE/PE OI Rising"
-    elif total_ce_oi_change < 0 and total_pe_oi_change < 0:
-        oi_change_sentiment = "📉 Both CE/PE OI Falling"
-    elif total_ce_oi_change > total_pe_oi_change:
-        oi_change_sentiment = "🔴 CE OI Rising Faster"
-    else:
-        oi_change_sentiment = "🟢 PE OI Rising Faster"
-    
-    msg += "*MARKET SENTIMENT & STATISTICS:*\n"
-    msg += f"• *PCR (OI):* `{pcr_oi:.3f}` {pcr_oi_sentiment}\n"
-    msg += f"• *PCR (Volume):* `{pcr_volume:.3f}`\n"
-    msg += f"• *Total CE OI:* `{fmt_val(total_ce_oi)}` | *Total PE OI:* `{fmt_val(total_pe_oi)}`\n"
-    msg += f"• *OI Change CE:* `{fmt_change(total_ce_oi_change)}` | *OI Change PE:* `{fmt_change(total_pe_oi_change)}`\n"
-    msg += f"• *Total CE Volume:* `{fmt_val(total_ce_volume)}` | *Total PE Volume:* `{fmt_val(total_pe_volume)}`\n"
-    msg += f"• *OI Trend:* {oi_change_sentiment}\n\n"
-    
-    msg += f"🕒 *Last Updated:* {datetime.now(IST).strftime('%I:%M:%S %p IST')}\n"
-    
-    return msg
-
-def fmt_val(value: float) -> str:
-    """Format large numbers with K, L, Cr suffixes"""
-    if value >= 10000000:
-        return f"{value/10000000:.1f}Cr"
-    elif value >= 100000:
-        return f"{value/100000:.1f}L"
-    elif value >= 1000:
-        return f"{value/1000:.1f}K"
-    else:
-        return f"{int(value)}"
-
-def fmt_change(change: float) -> str:
-    """Format change values with +/- signs and colors"""
-    if change > 0:
-        return f"+{fmt_val(change)}"
-    elif change < 0:
-        return f"-{fmt_val(abs(change))}"
-    else:
-        return " 0 "
-
-async def send_telegram_message(bot: Bot, text: str = None, photo: io.BytesIO = None, caption: str = None) -> bool:
-    """Send message to Telegram with enhanced error handling"""
-    try:
-        if photo:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID, 
-                photo=photo, 
-                caption=caption, 
-                parse_mode='Markdown'
-            )
-        else:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID, 
-                text=text, 
-                parse_mode='Markdown'
-            )
-        DAILY_STATS["total_alerts"] += 1
-        return True
-    except Exception as e:
-        print(f"❌ Telegram error: {e}")
-        return False
-
-async def process_instrument(bot: Bot, key: str, name: str, expiry_day: int, 
-                           is_stock: bool = False, idx: int = 0, total: int = 0) -> bool:
-    """Process a single instrument with comprehensive data"""
-    prefix = f"[{idx}/{total}] STOCK:" if is_stock else "INDEX:"
-    print(f"\n{prefix} {name}")
-    
-    try:
-        # Get spot price
-        spot = get_spot_price(key)
-        if spot == 0:
-            print(f"  ❌ Failed to get spot price for {name}")
-            return False
-        print(f"  ✅ Spot: ₹{spot:.2f}")
-        
-        # Get option chain
-        expiry = get_next_expiry(key, expiry_day=expiry_day)
-        strikes = get_option_chain(key, expiry)
-        
-        if strikes:
-            msg = format_option_chain_message(name, spot, expiry, strikes)
-            if msg:
-                success = await send_telegram_message(bot, text=msg)
-                if success:
-                    print("    📤 Comprehensive option chain sent")
-                else:
-                    print("    ❌ Failed to send option chain")
-        else:
-            print("    ⚠️ No option chain data found")
-        
-        # Get clean TradingView chart data
-        candles, hist_count = get_historical_data(key, name)
-        if candles and len(candles) >= 10:
-            chart = create_tradingview_chart(candles, name, spot, hist_count)
-            if chart:
-                caption = f"📈 *{name}* • Spot: `₹{spot:,.2f}` • {datetime.now(IST).strftime('%I:%M %p IST')}"
-                success = await send_telegram_message(bot, photo=chart, caption=caption)
-                if success:
-                    print("    📤 TradingView chart sent")
-                else:
-                    print("    ❌ Failed to send chart")
-        else:
-            print("    ⚠️ Insufficient data for chart")
-        
-        # Update statistics
-        if is_stock:
-            DAILY_STATS["stocks_count"] += 1
-        else:
-            DAILY_STATS["indices_count"] += 1
+            encoded_key = urllib.parse.quote(instrument_key, safe='')
+            all_candles = []
             
-        return True
+            # Historical (30 min data, will resample to 15m)
+            to_date = (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
+            from_date = (datetime.now(IST) - timedelta(days=30)).strftime('%Y-%m-%d')
+            url = f"{BASE_URL}/v2/historical-candle/{encoded_key}/30minute/{to_date}/{from_date}"
+            
+            response = requests.get(url, headers=self.headers, timeout=20)
+            
+            if response.status_code == 200:
+                candles_30min = response.json().get('data', {}).get('candles', [])
+                all_candles.extend(candles_30min)
+            
+            # Intraday (1 min data, will resample to 15m)
+            url = f"{BASE_URL}/v2/historical-candle/intraday/{encoded_key}/1minute"
+            response = requests.get(url, headers=self.headers, timeout=20)
+            
+            if response.status_code == 200:
+                candles_1min = response.json().get('data', {}).get('candles', [])
+                all_candles.extend(candles_1min)
+            
+            if not all_candles:
+                return None
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp').astype(float)
+            df = df.sort_index()
+            
+            # Resample to 15M
+            df_15m = df.resample('15min').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum',
+                'oi': 'last'
+            }).dropna()
+            
+            # Get last 400 candles
+            df_15m = df_15m.tail(candles_needed)
+            
+            return df_15m
+            
+        except Exception as e:
+            logger.error(f"15M data error: {e}")
+            return None
+
+# ==================== CHART GENERATOR ====================
+class ChartGenerator:
+    @staticmethod
+    def create_candlestick_chart(symbol: str, df: pd.DataFrame, spot_price: float, path: str):
+        """Create clean candlestick chart"""
         
-    except Exception as e:
-        print(f"  ❌ Processing error for {name}: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        # Colors
+        BG = '#FFFFFF'
+        GRID = '#E0E0E0'
+        TEXT = '#2C3E50'
+        GREEN = '#26a69a'
+        RED = '#ef5350'
+        YELLOW = '#FFD700'
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 10),
+                                       gridspec_kw={'height_ratios': [3, 1]},
+                                       facecolor=BG)
+        
+        ax1.set_facecolor(BG)
+        df_plot = df.reset_index(drop=True)
+        
+        # Candlesticks
+        for idx, row in df_plot.iterrows():
+            color = GREEN if row['close'] > row['open'] else RED
+            
+            # Wick
+            ax1.plot([idx+0.3, idx+0.3], [row['low'], row['high']],
+                    color=color, linewidth=1.2, alpha=0.8)
+            
+            # Body
+            ax1.add_patch(Rectangle(
+                (idx, min(row['open'], row['close'])),
+                0.6,
+                abs(row['close'] - row['open']) if abs(row['close'] - row['open']) > 0 else spot_price * 0.0001,
+                facecolor=color,
+                edgecolor=color,
+                alpha=0.85
+            ))
+        
+        # Highlight last candle
+        last_idx = len(df_plot) - 1
+        last_close = df_plot.iloc[-1]['close']
+        ax1.scatter([last_idx + 0.3], [last_close],
+                   color=YELLOW, s=250, marker='D', zorder=10,
+                   edgecolors=TEXT, linewidths=2, alpha=0.9)
+        
+        # Current price line
+        ax1.axhline(spot_price, color='#FF9800', linewidth=2, linestyle='--', alpha=0.7)
+        ax1.text(2, spot_price, f' Spot: ₹{spot_price:.2f}',
+                color='#FF9800', fontsize=10, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                         alpha=0.9, edgecolor='#FF9800', linewidth=1.5))
+        
+        # Title
+        title = f"{symbol} | 15M Timeframe | {len(df_plot)} Candles"
+        ax1.set_title(title, color=TEXT, fontsize=14, fontweight='bold', pad=15)
+        ax1.grid(True, color=GRID, alpha=0.4)
+        ax1.tick_params(colors=TEXT)
+        ax1.set_ylabel('Price (₹)', color=TEXT, fontsize=11, fontweight='bold')
+        
+        # Volume
+        ax2.set_facecolor(BG)
+        colors = [GREEN if df_plot.iloc[i]['close'] > df_plot.iloc[i]['open'] else RED
+                 for i in range(len(df_plot))]
+        ax2.bar(range(len(df_plot)), df_plot['volume'], color=colors, alpha=0.7, width=0.8)
+        ax2.set_ylabel('Volume', color=TEXT, fontsize=10, fontweight='bold')
+        ax2.tick_params(colors=TEXT)
+        ax2.grid(True, color=GRID, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(path, dpi=150, facecolor=BG)
+        plt.close()
 
-async def fetch_all(bot: Bot):
-    """Fetch data for all instruments"""
-    now = datetime.now(IST)
-    print(f"\n{'='*60}")
-    print(f"🚀 MARKET DATA RUN: {now.strftime('%I:%M:%S %p IST')}")
-    print(f"{'='*60}")
+# ==================== TELEGRAM NOTIFIER ====================
+class TelegramNotifier:
+    def __init__(self):
+        self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
     
-    # Send start message
-    header = f"🚀 *MARKET DATA UPDATE INITIATED*\n_Time: {now.strftime('%I:%M:%S %p IST')}_\n_Processing 4 indices + {len(NIFTY50_STOCKS)} stocks..._"
-    await send_telegram_message(bot, text=header)
-    
-    # Reset counters
-    DAILY_STATS["indices_count"] = 0
-    DAILY_STATS["stocks_count"] = 0
-    
-    # Process indices
-    print(f"\n📊 PROCESSING INDICES:")
-    for i, (key, info) in enumerate(INDICES.items(), 1):
-        await process_instrument(bot, key, info["name"], info["expiry_day"])
-        await asyncio.sleep(1.5)
-    
-    # Process stocks
-    print(f"\n📈 PROCESSING STOCKS:")
-    stock_items = list(NIFTY50_STOCKS.items())
-    for i, (key, symbol) in enumerate(stock_items, 1):
-        await process_instrument(
-            bot, key, symbol, 3, 
-            is_stock=True, idx=i, total=len(stock_items)
-        )
-        await asyncio.sleep(1.2)
-    
-    # Send completion summary
-    summary = (
-        f"✅ *MARKET UPDATE COMPLETE*\n\n"
-        f"📊 *Indices Processed:* {DAILY_STATS['indices_count']}/4\n"
-        f"📈 *Stocks Processed:* {DAILY_STATS['stocks_count']}/{len(NIFTY50_STOCKS)}\n"
-        f"📡 *Total Alerts Today:* {DAILY_STATS['total_alerts']}\n"
-        f"🔢 *API Calls Made:* {DAILY_STATS['api_calls']}\n\n"
-        f"⏰ *Next Update:* 5 minutes\n"
-        f"🕒 *Completed at:* {datetime.now(IST).strftime('%I:%M:%S %p IST')}"
-    )
-    await send_telegram_message(bot, text=summary)
-    
-    print(f"\n✅ CYCLE COMPLETED:")
-    print(f"   • Indices: {DAILY_STATS['indices_count']}/4")
-    print(f"   • Stocks: {DAILY_STATS['stocks_count']}/{len(NIFTY50_STOCKS)}")
-    print(f"   • API Calls: {DAILY_STATS['api_calls']}")
-    print(f"   • Total Alerts: {DAILY_STATS['total_alerts']}")
+    async def send_startup(self):
+        msg = f"""🚀 **OPTION CHAIN MONITOR v1.0**
 
-async def main():
-    """Main application loop"""
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+⏰ {datetime.now(IST).strftime('%d-%b %H:%M IST')}
+
+✅ Every 5 minutes scan
+✅ 21 ATM Strikes (OI, Volume, LTP)
+✅ 15M Chart (Last 400 candles)
+
+📊 Monitoring: {len(ALL_SYMBOLS)} symbols
+
+🟢 **BOT ACTIVE**"""
+        
+        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
     
-    while True:
+    async def send_option_chain_alert(self, symbol: str, display_name: str,
+                                     spot_price: float, strikes: List[StrikeData],
+                                     chart_path: str, expiry: str):
+        """Send option chain data with chart"""
+        try:
+            # Send chart first
+            with open(chart_path, 'rb') as photo:
+                await self.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=photo)
+            
+            # Calculate PCR
+            total_ce_oi = sum(s.ce_oi for s in strikes)
+            total_pe_oi = sum(s.pe_oi for s in strikes)
+            pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+            
+            # Build message
+            msg = f"""━━━━━━━━━━━━━━━━━━━━━━
+📊 **{display_name}**
+━━━━━━━━━━━━━━━━━━━━━━
+
+💹 **Spot:** ₹{spot_price:.2f}
+📅 **Expiry:** {expiry}
+📈 **PCR:** {pcr:.3f}
+
+━━━━━━━━━━━━━━━━━━━━━━
+🔢 **OPTION CHAIN (21 ATM Strikes)**
+━━━━━━━━━━━━━━━━━━━━━━
+
+```
+Strike | CE-OI    | CE-Vol  | CE-LTP | PE-LTP | PE-Vol  | PE-OI
+-------|----------|---------|--------|--------|---------|----------
+"""
+            
+            # Add strike data
+            for strike in strikes:
+                ce_oi_str = f"{strike.ce_oi:>8,}" if strike.ce_oi > 0 else "       -"
+                pe_oi_str = f"{strike.pe_oi:>8,}" if strike.pe_oi > 0 else "       -"
+                ce_vol_str = f"{strike.ce_volume:>7,}" if strike.ce_volume > 0 else "      -"
+                pe_vol_str = f"{strike.pe_volume:>7,}" if strike.pe_volume > 0 else "      -"
+                ce_ltp_str = f"{strike.ce_ltp:>6.2f}" if strike.ce_ltp > 0 else "     -"
+                pe_ltp_str = f"{strike.pe_ltp:>6.2f}" if strike.pe_ltp > 0 else "     -"
+                
+                # Highlight ATM strike
+                if abs(strike.strike - spot_price) < 50:
+                    strike_str = f"*{strike.strike:>6}*"
+                else:
+                    strike_str = f"{strike.strike:>6}"
+                
+                msg += f"{strike_str} | {ce_oi_str} | {ce_vol_str} | {ce_ltp_str} | {pe_ltp_str} | {pe_vol_str} | {pe_oi_str}\n"
+            
+            msg += f"""```
+
+━━━━━━━━━━━━━━━━━━━━━━
+📊 **SUMMARY**
+━━━━━━━━━━━━━━━━━━━━━━
+
+**Total CE OI:** {total_ce_oi:,}
+**Total PE OI:** {total_pe_oi:,}
+**PCR:** {pcr:.3f}
+
+🕐 {datetime.now(IST).strftime('%d-%b %H:%M IST')}
+━━━━━━━━━━━━━━━━━━━━━━"""
+            
+            await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
+            logger.info(f"  ✅ Alert sent: {display_name}")
+            
+        except Exception as e:
+            logger.error(f"Telegram error: {e}")
+            traceback.print_exc()
+
+# ==================== MAIN BOT ====================
+class OptionMonitorBot:
+    def __init__(self):
+        logger.info("🔄 Initializing Option Monitor v1.0...")
+        
+        self.fetcher = UpstoxDataFetcher()
+        self.notifier = TelegramNotifier()
+        
+        logger.info("✅ Bot ready")
+    
+    def is_market_open(self) -> bool:
         now = datetime.now(IST)
-        is_market_hours = (now.weekday() < 5) and (time(9, 15) <= now.time() <= time(15, 35))
+        if now.weekday() >= 5:
+            return False
+        current_time = now.time()
+        return time(9, 15) <= current_time <= time(15, 30)
+    
+    async def analyze_symbol(self, instrument_key: str, symbol_info: Dict):
+        try:
+            symbol_name = symbol_info.get('name', '')
+            display_name = symbol_info.get('display_name', symbol_name)
+            
+            logger.info(f"\n{'='*70}")
+            logger.info(f"🔍 {display_name}")
+            logger.info(f"{'='*70}")
+            
+            # Get expiry
+            expiry_api = ExpiryCalculator.get_best_expiry(instrument_key, symbol_info)
+            expiry_display = ExpiryCalculator.get_display_expiry(expiry_api)
+            logger.info(f"  📅 Expiry: {expiry_display}")
+            
+            # Get spot price
+            spot_price = self.fetcher.get_spot_price(instrument_key)
+            if spot_price == 0:
+                logger.warning(f"  ❌ No spot price")
+                return
+            
+            logger.info(f"  💹 Spot: ₹{spot_price:.2f}")
+            
+            # Get 15M chart data (last 400 candles)
+            df_15m = self.fetcher.get_15m_data(instrument_key, candles_needed=400)
+            if df_15m is None or len(df_15m) == 0:
+                logger.warning(f"  ⚠️ No 15M data")
+                return
+            
+            logger.info(f"  📊 15M Candles: {len(df_15m)}")
+            
+            # Get option chain
+            all_strikes = self.fetcher.get_option_chain(instrument_key, expiry_api)
+            if not all_strikes:
+                logger.warning(f"  ⚠️ No option chain data")
+                return
+            
+            # Get 21 ATM strikes (10 below + ATM + 10 above)
+            atm = round(spot_price / 100) * 100
+            
+            # Define strike range based on symbol type
+            if "INDEX" in instrument_key:
+                strike_interval = 100
+                strikes_count = 10
+            else:
+                strike_interval = 50 if spot_price < 2000 else 100
+                strikes_count = 10
+            
+            atm_strikes = []
+            for i in range(-strikes_count, strikes_count + 1):
+                target_strike = atm + (i * strike_interval)
+                # Find closest strike
+                matching_strike = min(all_strikes, 
+                                    key=lambda x: abs(x.strike - target_strike),
+                                    default=None)
+                if matching_strike and matching_strike not in atm_strikes:
+                    atm_strikes.append(matching_strike)
+            
+            # Sort strikes
+            atm_strikes = sorted(atm_strikes, key=lambda x: x.strike)[:21]
+            
+            if not atm_strikes:
+                logger.warning(f"  ⚠️ No ATM strikes found")
+                return
+            
+            logger.info(f"  🎯 ATM Strikes: {len(atm_strikes)}")
+            
+            # Generate chart
+            chart_path = f"/tmp/{symbol_name}_option_monitor.png"
+            ChartGenerator.create_candlestick_chart(
+                display_name, df_15m, spot_price, chart_path
+            )
+            logger.info(f"  📊 Chart generated")
+            
+            # Send alert
+            await self.notifier.send_option_chain_alert(
+                symbol_name, display_name, spot_price,
+                atm_strikes, chart_path, expiry_display
+            )
+            
+            logger.info(f"  ✅ Analysis complete")
+            
+        except Exception as e:
+            logger.error(f"Analysis error for {symbol_info.get('display_name')}: {e}")
+            traceback.print_exc()
+    
+    async def run_scan(self):
+        logger.info(f"\n{'='*80}")
+        logger.info(f"🔄 SCAN - {datetime.now(IST).strftime('%H:%M:%S IST')}")
+        logger.info(f"{'='*80}")
         
-        if is_market_hours:
-            if DAILY_STATS["start_time"] is None:
-                DAILY_STATS["start_time"] = now
-                DAILY_STATS["api_calls"] = 0
+        for idx, (key, info) in enumerate(ALL_SYMBOLS.items(), 1):
+            logger.info(f"\n[{idx}/{len(ALL_SYMBOLS)}]")
+            await self.analyze_symbol(key, info)
             
-            await fetch_all(bot)
-            print(f"\n⏳ Next run in 5 minutes...")
-            await asyncio.sleep(300)
-        else:
-            print(f"\n💤 Market closed. Current time: {now.strftime('%I:%M %p IST')}")
-            
-            if now.hour >= 16 and DAILY_STATS["start_time"] is not None:
-                print("🔄 Resetting daily stats for next trading day...")
-                DAILY_STATS.update({
-                    "total_alerts": 0,
-                    "indices_count": 0, 
-                    "stocks_count": 0,
-                    "start_time": None,
-                    "api_calls": 0
-                })
-            
-            await asyncio.sleep(900)
+            # Wait between symbols to avoid rate limits
+            if idx < len(ALL_SYMBOLS):
+                await asyncio.sleep(2)
+        
+        logger.info(f"\n{'='*80}")
+        logger.info(f"✅ SCAN COMPLETE")
+        logger.info(f"{'='*80}\n")
+    
+    async def run(self):
+        logger.info("="*80)
+        logger.info("OPTION CHAIN MONITOR v1.0")
+        logger.info("="*80)
+        
+        if not all([UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+            logger.error("❌ Missing credentials!")
+            return
+        
+        await self.notifier.send_startup()
+        
+        logger.info("="*80)
+        logger.info("🟢 RUNNING - Every 5 minutes")
+        logger.info("="*80)
+        
+        while True:
+            try:
+                if not self.is_market_open():
+                    logger.info("⏸️ Market closed. Waiting...")
+                    await asyncio.sleep(300)
+                    continue
+                
+                await self.run_scan()
+                
+                logger.info(f"⏳ Next scan in 5 minutes...")
+                await asyncio.sleep(SCAN_INTERVAL)
+                
+            except KeyboardInterrupt:
+                logger.info("🛑 Stopped by user")
+                break
+            except Exception as e:
+                logger.error(f"Loop error: {e}")
+                traceback.print_exc()
+                await asyncio.sleep(60)
+
+# ==================== ENTRY POINT ====================
+async def main():
+    try:
+        bot = OptionMonitorBot()
+        await bot.run()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
+    logger.info("="*80)
+    logger.info("STARTING OPTION CHAIN MONITOR v1.0")
+    logger.info("="*80)
+    
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Bot stopped by user.")
+        logger.info("\n✅ Shutdown complete")
     except Exception as e:
-        print(f"\n💥 Unexpected error: {e}")
-        import traceback
+        logger.error(f"\n❌ Critical error: {e}")
         traceback.print_exc()
