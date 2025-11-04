@@ -25,6 +25,8 @@ redis==5.0.1
 # ==================== RSS FEED PARSER (FIX FOR YOUR ERROR) ====================
 feedparser==6.0.10
 
+pyTelegramBotAPI
+
 # API Clients
 # All included via requests
 
