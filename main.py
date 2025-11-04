@@ -368,20 +368,70 @@ class DataFetcher:
             return []
     
     def get_candlestick_data(self, instrument_key: str) -> Optional[pd.DataFrame]:
+        """
+        Fetch 15M candle data using 30min + 1min resample approach
+        This works even when direct 15min API returns no data
+        """
         try:
             encoded_key = urllib.parse.quote(instrument_key, safe='')
-            url = f"{BASE_URL}/v2/historical-candle/intraday/{encoded_key}/15minute"
+            all_candles = []
+            
+            # Step 1: Get 30-minute historical data (last 30 days)
+            to_date = (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
+            from_date = (datetime.now(IST) - timedelta(days=30)).strftime('%Y-%m-%d')
+            url = f"{BASE_URL}/v2/historical-candle/{encoded_key}/30minute/{to_date}/{from_date}"
+            
             response = requests.get(url, headers=self.headers, timeout=20)
+            
             if response.status_code == 200:
-                candles = response.json().get('data', {}).get('candles', [])
-                if not candles:
-                    return None
-                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                df = df.set_index('timestamp').astype(float).sort_index()
-                return df.tail(8)
-            return None
-        except:
+                candles_30min = response.json().get('data', {}).get('candles', [])
+                if candles_30min:
+                    all_candles.extend(candles_30min)
+                    logger.info(f"  📊 30min candles: {len(candles_30min)}")
+            
+            # Step 2: Get 1-minute intraday data (today's live data)
+            url = f"{BASE_URL}/v2/historical-candle/intraday/{encoded_key}/1minute"
+            response = requests.get(url, headers=self.headers, timeout=20)
+            
+            if response.status_code == 200:
+                candles_1min = response.json().get('data', {}).get('candles', [])
+                if candles_1min:
+                    all_candles.extend(candles_1min)
+                    logger.info(f"  📊 1min candles: {len(candles_1min)}")
+            
+            if not all_candles:
+                logger.warning(f"  ⚠️ No candle data from both sources")
+                return None
+            
+            # Step 3: Convert to DataFrame
+            df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp').astype(float)
+            df = df.sort_index()
+            
+            # Step 4: Resample to 15M
+            df_15m = df.resample('15min').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum',
+                'oi': 'last'
+            }).dropna()
+            
+            # Step 5: Get last 8 candles
+            df_15m = df_15m.tail(8)
+            
+            if len(df_15m) == 0:
+                logger.warning(f"  ⚠️ No data after 15M resample")
+                return None
+            
+            logger.info(f"  ✅ 15M candles (resampled): {len(df_15m)}")
+            return df_15m
+            
+        except Exception as e:
+            logger.error(f"Candle data error: {e}")
+            traceback.print_exc()
             return None
     
     def get_vix(self) -> float:
