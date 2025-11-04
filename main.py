@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-OPTION CHAIN + CHART MONITOR v1.0
-===================================
-✅ Every 5 minutes scan
-✅ 21 ATM Strikes (OI, Volume, LTP)
-✅ 15M Candlestick Chart (Last 400 candles)
-✅ Clean PNG Chart Format
-✅ Telegram Alerts with Option Chain Table
-✅ Top F&O Stocks + Indices Only
+F&O ANALYSIS BOT WITH DEEPSEEK V3 + REDIS
+==========================================
+✅ Top 35 Stocks + 2 Indices (BankNifty, MidcapNifty)
+✅ Every 15 minutes scan
+✅ Redis: Store OI/Volume history (2 hours, 8 scans)
+✅ Compare: Current vs Previous OI changes
+✅ OI + Candlestick + FII/DII + VIX + News
+✅ DeepSeek V3 Analysis
+✅ Telegram Alerts (Only Buy Opportunities)
 """
 
 import os
@@ -16,6 +17,7 @@ import requests
 import urllib.parse
 from datetime import datetime, timedelta, time
 import pytz
+import json
 import time as time_sleep
 from telegram import Bot
 import matplotlib
@@ -24,16 +26,18 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import pandas as pd
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
 import traceback
+import feedparser
+import redis
 
 # ==================== CONFIGURATION ====================
 IST = pytz.timezone('Asia/Kolkata')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(), logging.FileHandler('option_monitor.log')]
+    handlers=[logging.StreamHandler(), logging.FileHandler('fo_analyzer.log')]
 )
 logger = logging.getLogger(__name__)
 
@@ -41,128 +45,59 @@ logger = logging.getLogger(__name__)
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 
 BASE_URL = "https://api.upstox.com"
-SCAN_INTERVAL = 300  # 5 minutes
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+SCAN_INTERVAL = 900  # 15 minutes
+REDIS_EXPIRY = 259200  # 3 days in seconds
 
-# ==================== SYMBOLS ====================
-# 📈 INDICES (F&O Available)
+# ==================== SYMBOLS (37 Total) ====================
 INDICES = {
-    "NSE_INDEX|Nifty 50": {"name": "NIFTY", "display_name": "NIFTY 50", "expiry_day": 3, "category": "INDEX"},
-    "NSE_INDEX|Nifty Bank": {"name": "BANKNIFTY", "display_name": "BANK NIFTY", "expiry_day": 2, "category": "INDEX"},
-    "NSE_INDEX|NIFTY MID SELECT": {"name": "MIDCPNIFTY", "display_name": "MIDCAP NIFTY", "expiry_day": 0, "category": "INDEX"},
-    "BSE_INDEX|SENSEX": {"name": "SENSEX", "display_name": "SENSEX", "expiry_day": 4, "category": "INDEX"}
+    "NSE_INDEX|Nifty Bank": {"name": "BANKNIFTY", "display_name": "BANK NIFTY", "expiry_day": 2},
+    "NSE_INDEX|NIFTY MID SELECT": {"name": "MIDCPNIFTY", "display_name": "MIDCAP NIFTY", "expiry_day": 0}
 }
 
-# 🚗 AUTO SECTOR
-AUTO_STOCKS = {
-    "NSE_EQ|INE467B01029": {"name": "TATAMOTORS", "display_name": "TATA MOTORS", "category": "AUTO"},
-    "NSE_EQ|INE585B01010": {"name": "MARUTI", "display_name": "MARUTI SUZUKI", "category": "AUTO"},
-    "NSE_EQ|INE208A01029": {"name": "ASHOKLEY", "display_name": "ASHOK LEYLAND", "category": "AUTO"},
-    "NSE_EQ|INE494B01023": {"name": "TVSMOTOR", "display_name": "TVS MOTOR", "category": "AUTO"},
-    "NSE_EQ|INE101A01026": {"name": "M&M", "display_name": "M&M", "category": "AUTO"},
-    "NSE_EQ|INE917I01010": {"name": "BAJAJ-AUTO", "display_name": "BAJAJ AUTO", "category": "AUTO"}
+TOP_STOCKS = {
+    "NSE_EQ|INE040A01034": {"name": "HDFCBANK", "display_name": "HDFC BANK"},
+    "NSE_EQ|INE090A01021": {"name": "ICICIBANK", "display_name": "ICICI BANK"},
+    "NSE_EQ|INE062A01020": {"name": "SBIN", "display_name": "STATE BANK"},
+    "NSE_EQ|INE238A01034": {"name": "AXISBANK", "display_name": "AXIS BANK"},
+    "NSE_EQ|INE237A01028": {"name": "KOTAKBANK", "display_name": "KOTAK BANK"},
+    "NSE_EQ|INE028A01039": {"name": "BANKBARODA", "display_name": "BANK OF BARODA"},
+    "NSE_EQ|INE476A01014": {"name": "CANBK", "display_name": "CANARA BANK"},
+    "NSE_EQ|INE528G01035": {"name": "FEDERALBNK", "display_name": "FEDERAL BANK"},
+    "NSE_EQ|INE467B01029": {"name": "TATAMOTORS", "display_name": "TATA MOTORS"},
+    "NSE_EQ|INE585B01010": {"name": "MARUTI", "display_name": "MARUTI SUZUKI"},
+    "NSE_EQ|INE101A01026": {"name": "M&M", "display_name": "M&M"},
+    "NSE_EQ|INE917I01010": {"name": "BAJAJ-AUTO", "display_name": "BAJAJ AUTO"},
+    "NSE_EQ|INE002A01018": {"name": "RELIANCE", "display_name": "RELIANCE"},
+    "NSE_EQ|INE213A01029": {"name": "ONGC", "display_name": "ONGC"},
+    "NSE_EQ|INE242A01010": {"name": "IOC", "display_name": "INDIAN OIL"},
+    "NSE_EQ|INE009A01021": {"name": "INFY", "display_name": "INFOSYS"},
+    "NSE_EQ|INE075A01022": {"name": "WIPRO", "display_name": "WIPRO"},
+    "NSE_EQ|INE854D01024": {"name": "TCS", "display_name": "TCS"},
+    "NSE_EQ|INE860A01027": {"name": "HCLTECH", "display_name": "HCL TECH"},
+    "NSE_EQ|INE214T01019": {"name": "LTIM", "display_name": "LTI MINDTREE"},
+    "NSE_EQ|INE081A01012": {"name": "TATASTEEL", "display_name": "TATA STEEL"},
+    "NSE_EQ|INE019A01038": {"name": "JSWSTEEL", "display_name": "JSW STEEL"},
+    "NSE_EQ|INE038A01020": {"name": "HINDALCO", "display_name": "HINDALCO"},
+    "NSE_EQ|INE044A01036": {"name": "SUNPHARMA", "display_name": "SUN PHARMA"},
+    "NSE_EQ|INE361B01024": {"name": "DIVISLAB", "display_name": "DIVI'S LAB"},
+    "NSE_EQ|INE089A01023": {"name": "DRREDDY", "display_name": "DR REDDY'S"},
+    "NSE_EQ|INE154A01025": {"name": "ITC", "display_name": "ITC"},
+    "NSE_EQ|INE030A01027": {"name": "HINDUNILVR", "display_name": "HUL"},
+    "NSE_EQ|INE216A01030": {"name": "BRITANNIA", "display_name": "BRITANNIA"},
+    "NSE_EQ|INE018A01030": {"name": "LT", "display_name": "L&T"},
+    "NSE_EQ|INE742F01042": {"name": "ADANIPORTS", "display_name": "ADANI PORTS"},
+    "NSE_EQ|INE397D01024": {"name": "BHARTIARTL", "display_name": "BHARTI AIRTEL"},
+    "NSE_EQ|INE296A01024": {"name": "BAJFINANCE", "display_name": "BAJAJ FINANCE"},
+    "NSE_EQ|INE280A01028": {"name": "TITAN", "display_name": "TITAN"},
+    "NSE_EQ|INE021A01026": {"name": "ASIANPAINT", "display_name": "ASIAN PAINTS"}
 }
 
-# 🏦 BANKING
-BANK_STOCKS = {
-    "NSE_EQ|INE040A01034": {"name": "HDFCBANK", "display_name": "HDFC BANK", "category": "BANK"},
-    "NSE_EQ|INE090A01021": {"name": "ICICIBANK", "display_name": "ICICI BANK", "category": "BANK"},
-    "NSE_EQ|INE062A01020": {"name": "SBIN", "display_name": "STATE BANK", "category": "BANK"},
-    "NSE_EQ|INE028A01039": {"name": "BANKBARODA", "display_name": "BANK OF BARODA", "category": "BANK"},
-    "NSE_EQ|INE238A01034": {"name": "AXISBANK", "display_name": "AXIS BANK", "category": "BANK"},
-    "NSE_EQ|INE237A01028": {"name": "KOTAKBANK", "display_name": "KOTAK BANK", "category": "BANK"},
-    "NSE_EQ|INE949L01017": {"name": "AUBANK", "display_name": "AU SMALL FINANCE", "category": "BANK"}
-}
-
-# 🏭 METALS
-METAL_STOCKS = {
-    "NSE_EQ|INE081A01012": {"name": "TATASTEEL", "display_name": "TATA STEEL", "category": "METAL"},
-    "NSE_EQ|INE038A01020": {"name": "HINDALCO", "display_name": "HINDALCO", "category": "METAL"},
-    "NSE_EQ|INE019A01038": {"name": "JSWSTEEL", "display_name": "JSW STEEL", "category": "METAL"},
-    "NSE_EQ|INE139A01034": {"name": "NATIONALUM", "display_name": "NATIONAL ALUMINIUM", "category": "METAL"}
-}
-
-# ⛽ OIL & GAS
-OIL_GAS_STOCKS = {
-    "NSE_EQ|INE002A01018": {"name": "RELIANCE", "display_name": "RELIANCE", "category": "OIL_GAS"},
-    "NSE_EQ|INE213A01029": {"name": "ONGC", "display_name": "ONGC", "category": "OIL_GAS"},
-    "NSE_EQ|INE242A01010": {"name": "IOC", "display_name": "INDIAN OIL", "category": "OIL_GAS"},
-    "NSE_EQ|INE029A01011": {"name": "BPCL", "display_name": "BHARAT PETROLEUM", "category": "OIL_GAS"},
-    "NSE_EQ|INE347G01014": {"name": "PETRONET", "display_name": "PETRONET LNG", "category": "OIL_GAS"}
-}
-
-# 💻 IT SECTOR
-IT_STOCKS = {
-    "NSE_EQ|INE009A01021": {"name": "INFY", "display_name": "INFOSYS", "category": "IT"},
-    "NSE_EQ|INE075A01022": {"name": "WIPRO", "display_name": "WIPRO", "category": "IT"},
-    "NSE_EQ|INE854D01024": {"name": "TCS", "display_name": "TCS", "category": "IT"},
-    "NSE_EQ|INE860A01027": {"name": "HCLTECH", "display_name": "HCL TECH", "category": "IT"},
-    "NSE_EQ|INE214T01019": {"name": "LTIM", "display_name": "LTI MINDTREE", "category": "IT"}
-}
-
-# 💊 PHARMA
-PHARMA_STOCKS = {
-    "NSE_EQ|INE044A01036": {"name": "SUNPHARMA", "display_name": "SUN PHARMA", "category": "PHARMA"},
-    "NSE_EQ|INE361B01024": {"name": "DIVISLAB", "display_name": "DIVI'S LAB", "category": "PHARMA"},
-    "NSE_EQ|INE089A01023": {"name": "DRREDDY", "display_name": "DR REDDY'S", "category": "PHARMA"},
-    "NSE_EQ|INE059A01026": {"name": "CIPLA", "display_name": "CIPLA", "category": "PHARMA"}
-}
-
-# 🛒 FMCG
-FMCG_STOCKS = {
-    "NSE_EQ|INE154A01025": {"name": "ITC", "display_name": "ITC", "category": "FMCG"},
-    "NSE_EQ|INE030A01027": {"name": "HINDUNILVR", "display_name": "HINDUSTAN UNILEVER", "category": "FMCG"},
-    "NSE_EQ|INE216A01030": {"name": "BRITANNIA", "display_name": "BRITANNIA", "category": "FMCG"},
-    "NSE_EQ|INE016A01026": {"name": "DABUR", "display_name": "DABUR", "category": "FMCG"}
-}
-
-# ⚡ INFRA/POWER
-INFRA_POWER_STOCKS = {
-    "NSE_EQ|INE742F01042": {"name": "ADANIPORTS", "display_name": "ADANI PORTS", "category": "INFRA"},
-    "NSE_EQ|INE733E01010": {"name": "NTPC", "display_name": "NTPC", "category": "POWER"},
-    "NSE_EQ|INE752E01010": {"name": "POWERGRID", "display_name": "POWER GRID", "category": "POWER"},
-    "NSE_EQ|INE018A01030": {"name": "LT", "display_name": "L&T", "category": "INFRA"}
-}
-
-# 👕 RETAIL/CONSUMER
-RETAIL_CONSUMER_STOCKS = {
-    "NSE_EQ|INE280A01028": {"name": "TITAN", "display_name": "TITAN", "category": "RETAIL"},
-    "NSE_EQ|INE797F01012": {"name": "JUBLFOOD", "display_name": "JUBILANT FOODWORKS", "category": "RETAIL"},
-    "NSE_EQ|INE849A01020": {"name": "TRENT", "display_name": "TRENT", "category": "RETAIL"},
-    "NSE_EQ|INE021A01026": {"name": "ASIANPAINT", "display_name": "ASIAN PAINTS", "category": "RETAIL"},
-    "NSE_EQ|INE140A01024": {"name": "PAGEIND", "display_name": "PAGE INDUSTRIES", "category": "RETAIL"}
-}
-
-# 🛡️ INSURANCE
-INSURANCE_STOCKS = {
-    "NSE_EQ|INE795G01014": {"name": "HDFCLIFE", "display_name": "HDFC LIFE", "category": "INSURANCE"},
-    "NSE_EQ|INE123W01016": {"name": "SBILIFE", "display_name": "SBI LIFE", "category": "INSURANCE"},
-    "NSE_EQ|INE115A01026": {"name": "LICHSGFIN", "display_name": "LIC HOUSING", "category": "INSURANCE"}
-}
-
-# 📱 OTHERS (Telecom, Finance)
-OTHER_STOCKS = {
-    "NSE_EQ|INE397D01024": {"name": "BHARTIARTL", "display_name": "BHARTI AIRTEL", "category": "TELECOM"},
-    "NSE_EQ|INE296A01024": {"name": "BAJFINANCE", "display_name": "BAJAJ FINANCE", "category": "FINANCE"},
-    "NSE_EQ|INE758T01015": {"name": "JIOFIN", "display_name": "JIO FINANCIAL", "category": "FINANCE"}
-}
-
-# ✅ COMBINE ALL SYMBOLS
-ALL_SYMBOLS = {
-    **INDICES,
-    **AUTO_STOCKS,
-    **BANK_STOCKS,
-    **METAL_STOCKS,
-    **OIL_GAS_STOCKS,
-    **IT_STOCKS,
-    **PHARMA_STOCKS,
-    **FMCG_STOCKS,
-    **INFRA_POWER_STOCKS,
-    **RETAIL_CONSUMER_STOCKS,
-    **INSURANCE_STOCKS,
-    **OTHER_STOCKS
-}
+ALL_SYMBOLS = {**INDICES, **TOP_STOCKS}
 
 # ==================== DATA CLASSES ====================
 @dataclass
@@ -175,21 +110,179 @@ class StrikeData:
     ce_ltp: float
     pe_ltp: float
 
+@dataclass
+class OISnapshot:
+    timestamp: str
+    spot_price: float
+    strikes: List[Dict]  # List of strike data
+    pcr: float
+    total_ce_oi: int
+    total_pe_oi: int
+    total_ce_volume: int
+    total_pe_volume: int
+
+@dataclass
+class MarketContext:
+    fii_buy: float
+    fii_sell: float
+    fii_net: float
+    dii_buy: float
+    dii_sell: float
+    dii_net: float
+    vix: float
+    news_headlines: List[str]
+
+# ==================== REDIS MANAGER ====================
+class RedisManager:
+    def __init__(self):
+        try:
+            self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+            self.redis_client.ping()
+            logger.info("✅ Redis connected")
+        except Exception as e:
+            logger.error(f"❌ Redis connection failed: {e}")
+            self.redis_client = None
+    
+    def save_oi_snapshot(self, symbol: str, snapshot: OISnapshot):
+        """Save current OI snapshot to Redis"""
+        if not self.redis_client:
+            return
+        
+        try:
+            key = f"oi:{symbol}:current"
+            data = {
+                'timestamp': snapshot.timestamp,
+                'spot_price': snapshot.spot_price,
+                'strikes': json.dumps(snapshot.strikes),
+                'pcr': snapshot.pcr,
+                'total_ce_oi': snapshot.total_ce_oi,
+                'total_pe_oi': snapshot.total_pe_oi,
+                'total_ce_volume': snapshot.total_ce_volume,
+                'total_pe_volume': snapshot.total_pe_volume
+            }
+            
+            # Save current
+            self.redis_client.hset(key, mapping=data)
+            self.redis_client.expire(key, REDIS_EXPIRY)
+            
+            # Add to history (FIFO queue, max 8 entries = 2 hours)
+            history_key = f"oi:{symbol}:history"
+            self.redis_client.lpush(history_key, json.dumps(data))
+            self.redis_client.ltrim(history_key, 0, 7)  # Keep last 8
+            self.redis_client.expire(history_key, REDIS_EXPIRY)
+            
+            logger.info(f"  💾 Redis: Saved {symbol}")
+            
+        except Exception as e:
+            logger.error(f"Redis save error: {e}")
+    
+    def get_previous_oi(self, symbol: str) -> Optional[Dict]:
+        """Get previous scan OI data (15 mins ago)"""
+        if not self.redis_client:
+            return None
+        
+        try:
+            key = f"oi:{symbol}:current"
+            data = self.redis_client.hgetall(key)
+            
+            if data:
+                data['strikes'] = json.loads(data['strikes'])
+                data['spot_price'] = float(data['spot_price'])
+                data['pcr'] = float(data['pcr'])
+                data['total_ce_oi'] = int(data['total_ce_oi'])
+                data['total_pe_oi'] = int(data['total_pe_oi'])
+                data['total_ce_volume'] = int(data['total_ce_volume'])
+                data['total_pe_volume'] = int(data['total_pe_volume'])
+                return data
+            return None
+            
+        except Exception as e:
+            logger.error(f"Redis get error: {e}")
+            return None
+    
+    def get_oi_history(self, symbol: str) -> List[Dict]:
+        """Get last 2 hours OI history (8 scans)"""
+        if not self.redis_client:
+            return []
+        
+        try:
+            history_key = f"oi:{symbol}:history"
+            history_raw = self.redis_client.lrange(history_key, 0, -1)
+            
+            history = []
+            for item in history_raw:
+                data = json.loads(item)
+                data['strikes'] = json.loads(data['strikes'])
+                history.append(data)
+            
+            return history
+            
+        except Exception as e:
+            logger.error(f"Redis history error: {e}")
+            return []
+    
+    def compare_oi_changes(self, symbol: str, current: OISnapshot) -> Dict:
+        """Compare current OI with previous scan"""
+        previous = self.get_previous_oi(symbol)
+        
+        if not previous:
+            return {
+                'has_previous': False,
+                'spot_change': 0,
+                'pcr_change': 0,
+                'ce_oi_change': 0,
+                'pe_oi_change': 0,
+                'ce_volume_change': 0,
+                'pe_volume_change': 0,
+                'strike_changes': []
+            }
+        
+        # Calculate changes
+        spot_change = current.spot_price - previous['spot_price']
+        pcr_change = current.pcr - previous['pcr']
+        ce_oi_change = current.total_ce_oi - previous['total_ce_oi']
+        pe_oi_change = current.total_pe_oi - previous['total_pe_oi']
+        ce_volume_change = current.total_ce_volume - previous['total_ce_volume']
+        pe_volume_change = current.total_pe_volume - previous['total_pe_volume']
+        
+        # Strike-wise changes
+        strike_changes = []
+        prev_strikes = {s['strike']: s for s in previous['strikes']}
+        
+        for curr_strike in current.strikes:
+            strike_val = curr_strike['strike']
+            if strike_val in prev_strikes:
+                prev = prev_strikes[strike_val]
+                strike_changes.append({
+                    'strike': strike_val,
+                    'ce_oi_change': curr_strike['ce_oi'] - prev['ce_oi'],
+                    'pe_oi_change': curr_strike['pe_oi'] - prev['pe_oi'],
+                    'ce_volume_change': curr_strike['ce_volume'] - prev['ce_volume'],
+                    'pe_volume_change': curr_strike['pe_volume'] - prev['pe_volume']
+                })
+        
+        return {
+            'has_previous': True,
+            'time_diff': '15 mins',
+            'spot_change': spot_change,
+            'spot_change_pct': (spot_change / previous['spot_price'] * 100) if previous['spot_price'] > 0 else 0,
+            'pcr_change': pcr_change,
+            'ce_oi_change': ce_oi_change,
+            'pe_oi_change': pe_oi_change,
+            'ce_volume_change': ce_volume_change,
+            'pe_volume_change': pe_volume_change,
+            'strike_changes': strike_changes
+        }
+
 # ==================== EXPIRY CALCULATOR ====================
 class ExpiryCalculator:
     @staticmethod
     def get_all_expiries_from_api(instrument_key: str) -> List[str]:
         try:
-            headers = {
-                "Accept": "application/json",
-                "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"
-            }
-            
+            headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
             encoded_key = urllib.parse.quote(instrument_key, safe='')
             url = f"{BASE_URL}/v2/option/contract?instrument_key={encoded_key}"
-            
             response = requests.get(url, headers=headers, timeout=10)
-            
             if response.status_code == 200:
                 contracts = response.json().get('data', [])
                 expiries = sorted(list(set(c['expiry'] for c in contracts if 'expiry' in c)))
@@ -199,95 +292,67 @@ class ExpiryCalculator:
             return []
     
     @staticmethod
-    def calculate_monthly_expiry(symbol_name: str, expiry_day: int = 3) -> str:
+    def calculate_monthly_expiry(expiry_day: int = 3) -> str:
         today = datetime.now(IST).date()
         current_time = datetime.now(IST).time()
-        
         last_day = (today.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
         days_to_subtract = (last_day.weekday() - expiry_day) % 7
         expiry = last_day - timedelta(days=days_to_subtract)
-        
         if expiry < today or (expiry == today and current_time >= time(15, 30)):
             next_month = (today.replace(day=28) + timedelta(days=4))
             last_day = (next_month.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
             days_to_subtract = (last_day.weekday() - expiry_day) % 7
             expiry = last_day - timedelta(days=days_to_subtract)
-        
         return expiry.strftime('%Y-%m-%d')
     
     @staticmethod
     def get_best_expiry(instrument_key: str, symbol_info: Dict) -> str:
         expiry_day = symbol_info.get('expiry_day', 3)
-        
         expiries = ExpiryCalculator.get_all_expiries_from_api(instrument_key)
-        
         if expiries:
             today = datetime.now(IST).date()
             now_time = datetime.now(IST).time()
-            
-            future_expiries = []
-            for exp_str in expiries:
-                try:
-                    exp_date = datetime.strptime(exp_str, '%Y-%m-%d').date()
-                    if exp_date > today or (exp_date == today and now_time < time(15, 30)):
-                        future_expiries.append(exp_str)
-                except:
-                    continue
-            
+            future_expiries = [exp_str for exp_str in expiries 
+                             if datetime.strptime(exp_str, '%Y-%m-%d').date() > today 
+                             or (datetime.strptime(exp_str, '%Y-%m-%d').date() == today and now_time < time(15, 30))]
             if future_expiries:
                 return min(future_expiries)
-        
-        return ExpiryCalculator.calculate_monthly_expiry(symbol_info.get('name', ''), expiry_day)
-    
-    @staticmethod
-    def get_display_expiry(expiry_str: str) -> str:
-        try:
-            dt = datetime.strptime(expiry_str, '%Y-%m-%d')
-            return dt.strftime('%d%b%y').upper()
-        except:
-            return expiry_str
+        return ExpiryCalculator.calculate_monthly_expiry(expiry_day)
 
-# ==================== DATA FETCHER ====================
-class UpstoxDataFetcher:
+# ==================== DATA FETCHERS ====================
+class DataFetcher:
     def __init__(self):
-        self.headers = {
-            "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
-            "Accept": "application/json"
+        self.headers = {"Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}", "Accept": "application/json"}
+        self.nse_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9'
         }
     
     def get_spot_price(self, instrument_key: str) -> float:
         try:
             encoded_key = urllib.parse.quote(instrument_key, safe='')
             url = f"{BASE_URL}/v2/market-quote/ltp?instrument_key={encoded_key}"
-            
             response = requests.get(url, headers=self.headers, timeout=10)
-            
             if response.status_code == 200:
                 data = response.json().get('data', {})
                 if data:
-                    ltp = list(data.values())[0].get('last_price', 0)
-                    return float(ltp)
+                    return float(list(data.values())[0].get('last_price', 0))
             return 0.0
         except:
             return 0.0
     
     def get_option_chain(self, instrument_key: str, expiry: str) -> List[StrikeData]:
-        """Fetch option chain with LTP"""
         try:
             encoded_key = urllib.parse.quote(instrument_key, safe='')
             url = f"{BASE_URL}/v2/option/chain?instrument_key={encoded_key}&expiry_date={expiry}"
-            
             response = requests.get(url, headers=self.headers, timeout=20)
-            
             if response.status_code == 200:
-                data = response.json()
-                strikes_raw = data.get('data', [])
-                
+                data = response.json().get('data', [])
                 strikes = []
-                for item in strikes_raw:
+                for item in data:
                     call_data = item.get('call_options', {}).get('market_data', {})
                     put_data = item.get('put_options', {}).get('market_data', {})
-                    
                     strikes.append(StrikeData(
                         strike=int(item.get('strike_price', 0)),
                         ce_oi=call_data.get('oi', 0),
@@ -297,146 +362,474 @@ class UpstoxDataFetcher:
                         ce_ltp=call_data.get('ltp', 0),
                         pe_ltp=put_data.get('ltp', 0)
                     ))
-                
                 return strikes
             return []
         except Exception as e:
             logger.error(f"Option chain error: {e}")
             return []
     
-    def get_15m_data(self, instrument_key: str, candles_needed: int = 400) -> Optional[pd.DataFrame]:
-        """Fetch 15M candles - Last 400 candles"""
+    def get_candlestick_data(self, instrument_key: str) -> Optional[pd.DataFrame]:
         try:
             encoded_key = urllib.parse.quote(instrument_key, safe='')
-            all_candles = []
-            
-            # Historical (30 min data, will resample to 15m)
-            to_date = (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
-            from_date = (datetime.now(IST) - timedelta(days=30)).strftime('%Y-%m-%d')
-            url = f"{BASE_URL}/v2/historical-candle/{encoded_key}/30minute/{to_date}/{from_date}"
-            
+            url = f"{BASE_URL}/v2/historical-candle/intraday/{encoded_key}/15minute"
             response = requests.get(url, headers=self.headers, timeout=20)
-            
             if response.status_code == 200:
-                candles_30min = response.json().get('data', {}).get('candles', [])
-                all_candles.extend(candles_30min)
-            
-            # Intraday (1 min data, will resample to 15m)
-            url = f"{BASE_URL}/v2/historical-candle/intraday/{encoded_key}/1minute"
-            response = requests.get(url, headers=self.headers, timeout=20)
-            
-            if response.status_code == 200:
-                candles_1min = response.json().get('data', {}).get('candles', [])
-                all_candles.extend(candles_1min)
-            
-            if not all_candles:
-                return None
-            
-            # Convert to DataFrame
-            df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df = df.set_index('timestamp').astype(float)
-            df = df.sort_index()
-            
-            # Resample to 15M
-            df_15m = df.resample('15min').agg({
-                'open': 'first',
-                'high': 'max',
-                'low': 'min',
-                'close': 'last',
-                'volume': 'sum',
-                'oi': 'last'
-            }).dropna()
-            
-            # Get last 400 candles
-            df_15m = df_15m.tail(candles_needed)
-            
-            return df_15m
-            
-        except Exception as e:
-            logger.error(f"15M data error: {e}")
+                candles = response.json().get('data', {}).get('candles', [])
+                if not candles:
+                    return None
+                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df.set_index('timestamp').astype(float).sort_index()
+                return df.tail(8)
             return None
+        except:
+            return None
+    
+    def get_vix(self) -> float:
+        try:
+            vix_key = "NSE_INDEX|India VIX"
+            return self.get_spot_price(vix_key)
+        except:
+            return 0.0
+    
+    def get_fii_dii_data(self) -> Dict:
+        try:
+            url = "https://www.nseindia.com/api/fiidiiTrading"
+            session = requests.Session()
+            session.get("https://www.nseindia.com", headers=self.nse_headers, timeout=10)
+            time_sleep.sleep(1)
+            response = session.get(url, headers=self.nse_headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data:
+                    fii_data = data[0] if isinstance(data, list) else data
+                    return {
+                        'fii_buy': float(fii_data.get('fii', {}).get('buyValue', 0)),
+                        'fii_sell': float(fii_data.get('fii', {}).get('sellValue', 0)),
+                        'fii_net': float(fii_data.get('fii', {}).get('netValue', 0)),
+                        'dii_buy': float(fii_data.get('dii', {}).get('buyValue', 0)),
+                        'dii_sell': float(fii_data.get('dii', {}).get('sellValue', 0)),
+                        'dii_net': float(fii_data.get('dii', {}).get('netValue', 0))
+                    }
+            return {'fii_buy': 0, 'fii_sell': 0, 'fii_net': 0, 'dii_buy': 0, 'dii_sell': 0, 'dii_net': 0}
+        except:
+            return {'fii_buy': 0, 'fii_sell': 0, 'fii_net': 0, 'dii_buy': 0, 'dii_sell': 0, 'dii_net': 0}
+    
+    def get_market_news(self) -> List[str]:
+        try:
+            headlines = []
+            feeds = [
+                "https://www.moneycontrol.com/rss/latestnews.xml",
+                "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"
+            ]
+            for feed_url in feeds:
+                try:
+                    feed = feedparser.parse(feed_url)
+                    for entry in feed.entries[:3]:
+                        title = entry.title
+                        if any(keyword in title.lower() for keyword in ['nifty', 'sensex', 'market', 'stock', 'rupee', 'rbi', 'fed']):
+                            headlines.append(title)
+                except:
+                    continue
+            return headlines[:5]
+        except:
+            return []
 
 # ==================== CHART GENERATOR ====================
 class ChartGenerator:
     @staticmethod
-    def create_candlestick_chart(symbol: str, df: pd.DataFrame, spot_price: float, category: str, path: str):
-        """Create clean candlestick chart with category"""
-        
-        # Colors
-        BG = '#FFFFFF'
-        GRID = '#E0E0E0'
-        TEXT = '#2C3E50'
-        GREEN = '#26a69a'
-        RED = '#ef5350'
-        YELLOW = '#FFD700'
-        
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(18, 10),
-                                       gridspec_kw={'height_ratios': [3, 1]},
-                                       facecolor=BG)
-        
-        ax1.set_facecolor(BG)
+    def create_chart(symbol: str, df: pd.DataFrame, spot_price: float, path: str):
+        fig, ax = plt.subplots(figsize=(12, 6), facecolor='white')
+        ax.set_facecolor('white')
         df_plot = df.reset_index(drop=True)
         
-        # Candlesticks
         for idx, row in df_plot.iterrows():
-            color = GREEN if row['close'] > row['open'] else RED
-            
-            # Wick
-            ax1.plot([idx+0.3, idx+0.3], [row['low'], row['high']],
-                    color=color, linewidth=1.2, alpha=0.8)
-            
-            # Body
-            ax1.add_patch(Rectangle(
-                (idx, min(row['open'], row['close'])),
-                0.6,
-                abs(row['close'] - row['open']) if abs(row['close'] - row['open']) > 0 else spot_price * 0.0001,
-                facecolor=color,
-                edgecolor=color,
-                alpha=0.85
-            ))
+            color = '#26a69a' if row['close'] > row['open'] else '#ef5350'
+            ax.plot([idx+0.3, idx+0.3], [row['low'], row['high']], color=color, linewidth=1.2)
+            ax.add_patch(Rectangle((idx, min(row['open'], row['close'])), 0.6,
+                                  abs(row['close'] - row['open']) if abs(row['close'] - row['open']) > 0 else spot_price * 0.0001,
+                                  facecolor=color, edgecolor=color, alpha=0.85))
         
-        # Highlight last candle
-        last_idx = len(df_plot) - 1
-        last_close = df_plot.iloc[-1]['close']
-        ax1.scatter([last_idx + 0.3], [last_close],
-                   color=YELLOW, s=250, marker='D', zorder=10,
-                   edgecolors=TEXT, linewidths=2, alpha=0.9)
+        ax.axhline(spot_price, color='#FF9800', linewidth=2, linestyle='--', alpha=0.7)
+        ax.text(1, spot_price, f' ₹{spot_price:.2f}', color='#FF9800', fontsize=10, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.9, edgecolor='#FF9800'))
         
-        # Current price line
-        ax1.axhline(spot_price, color='#FF9800', linewidth=2, linestyle='--', alpha=0.7)
-        ax1.text(2, spot_price, f' Spot: ₹{spot_price:.2f}',
-                color='#FF9800', fontsize=10, fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
-                         alpha=0.9, edgecolor='#FF9800', linewidth=1.5))
-        
-        # Category emoji
-        category_emoji = {
-            "INDEX": "📈", "AUTO": "🚗", "BANK": "🏦", "METAL": "🏭",
-            "OIL_GAS": "⛽", "IT": "💻", "PHARMA": "💊", "FMCG": "🛒",
-            "INFRA": "⚡", "POWER": "⚡", "RETAIL": "👕", "INSURANCE": "🛡️",
-            "TELECOM": "📱", "FINANCE": "💰"
-        }.get(category, "📊")
-        
-        # Title
-        title = f"{category_emoji} {symbol} | 15M | {len(df_plot)} Candles"
-        ax1.set_title(title, color=TEXT, fontsize=14, fontweight='bold', pad=15)
-        ax1.grid(True, color=GRID, alpha=0.4)
-        ax1.tick_params(colors=TEXT)
-        ax1.set_ylabel('Price (₹)', color=TEXT, fontsize=11, fontweight='bold')
-        
-        # Volume
-        ax2.set_facecolor(BG)
-        colors = [GREEN if df_plot.iloc[i]['close'] > df_plot.iloc[i]['open'] else RED
-                 for i in range(len(df_plot))]
-        ax2.bar(range(len(df_plot)), df_plot['volume'], color=colors, alpha=0.7, width=0.8)
-        ax2.set_ylabel('Volume', color=TEXT, fontsize=10, fontweight='bold')
-        ax2.tick_params(colors=TEXT)
-        ax2.grid(True, color=GRID, alpha=0.3)
-        
+        ax.set_title(f"{symbol} | 15M | Last 2 Hours", fontsize=14, fontweight='bold', pad=15)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylabel('Price (₹)', fontsize=11, fontweight='bold')
         plt.tight_layout()
-        plt.savefig(path, dpi=150, facecolor=BG)
+        plt.savefig(path, dpi=120, facecolor='white')
         plt.close()
+
+# ==================== DEEPSEEK ANALYZER ====================
+class DeepSeekAnalyzer:
+    def __init__(self):
+        self.api_key = DEEPSEEK_API_KEY
+        self.url = DEEPSEEK_URL
+    
+    def compress_data(self, symbol: str, spot: float, candles: pd.DataFrame, strikes: List[StrikeData], 
+                     context: MarketContext, expiry: str, oi_comparison: Dict) -> str:
+        candle_str = "|".join([f"{int(row['open'])}/{int(row['high'])}/{int(row['low'])}/{int(row['close'])}:{int(row['volume']/1000)}K" 
+                               for _, row in candles.iterrows()])
+        
+        atm = round(spot / 100) * 100
+        atm_strikes = [s for s in strikes if abs(s.strike - atm) <= 1000][:21]
+        oi_str = "\n".join([f"{s.strike}|C:{s.ce_oi//1000}K,{s.ce_volume//1000}K|P:{s.pe_oi//1000}K,{s.pe_volume//1000}K" 
+                           for s in sorted(atm_strikes, key=lambda x: x.strike)])
+        
+        total_ce_oi = sum(s.ce_oi for s in atm_strikes)
+        total_pe_oi = sum(s.pe_oi for s in atm_strikes)
+        pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+        
+        news_str = "\n".join([f"- {h}" for h in context.news_headlines[:3]])
+        
+        # OI Comparison section
+        oi_comp_str = ""
+        if oi_comparison['has_previous']:
+            oi_comp_str = f"""
+OI CHANGES (vs 15 mins ago):
+Spot: {oi_comparison['spot_change']:+.2f} ({oi_comparison['spot_change_pct']:+.2f}%)
+PCR: {oi_comparison['pcr_change']:+.3f}
+Total CE OI: {oi_comparison['ce_oi_change']:+,} | Vol: {oi_comparison['ce_volume_change']:+,}
+Total PE OI: {oi_comparison['pe_oi_change']:+,} | Vol: {oi_comparison['pe_volume_change']:+,}
+
+Top 5 Strike Changes:
+{self._format_strike_changes(oi_comparison['strike_changes'][:5])}
+"""
+        else:
+            oi_comp_str = "OI CHANGES: First scan, no previous data"
+        
+        data = f"""INSTRUMENT: {symbol}
+SPOT: ₹{spot:.2f}
+EXPIRY: {expiry}
+VIX: {context.vix:.2f}
+
+CANDLES (15M, Last 8): O/H/L/C:Vol
+{candle_str}
+
+OPTION CHAIN (21 ATM):
+Strike|Call_OI,Vol|Put_OI,Vol
+{oi_str}
+
+PCR: {pcr:.3f}
+{oi_comp_str}
+FII/DII (Today, ₹Cr):
+FII: Buy {context.fii_buy:.0f}, Sell {context.fii_sell:.0f}, Net {context.fii_net:+.0f}
+DII: Buy {context.dii_buy:.0f}, Sell {context.dii_sell:.0f}, Net {context.dii_net:+.0f}
+
+NEWS:
+{news_str if news_str else "No major news"}"""
+        
+        return data
+    
+    def _format_strike_changes(self, changes: List[Dict]) -> str:
+        lines = []
+        for c in changes:
+            lines.append(f"{c['strike']}: CE OI {c['ce_oi_change']:+,}, PE OI {c['pe_oi_change']:+,}")
+        return "\n".join(lines)
+    
+    def analyze(self, compressed_data: str) -> Optional[str]:
+        try:
+            system_prompt = """You are an elite F&O trader with 20+ years experience in Indian markets (NSE). You specialize in pure price action + OI analysis without any lagging indicators.
+
+═══════════════════════════════════════════════════════════════════════════════
+🎯 ANALYSIS FRAMEWORK (Follow this exact sequence)
+═══════════════════════════════════════════════════════════════════════════════
+
+## **SECTION 1: OI ANALYSIS (Deep Dive)**
+
+**1.1 OI Based Sentiment:**
+```
+PCR = [Value from data]
+├─ >1.3 = Strong Bullish (तेजी प्रचंड)
+├─ 1.0-1.3 = Bullish (तेजी मध्यम)
+├─ 0.8-1.0 = Neutral (काहीच नाही)
+├─ 0.6-0.8 = Bearish (मंदी मध्यम)
+└─ <0.6 = Strong Bearish (मंदी प्रचंड)
+
+Current Sentiment: [Interpretation]
+```
+
+**1.2 OI Changes Analysis (CRITICAL - Last 15 mins):**
+```
+Check from "OI CHANGES" section in data:
+
+Call OI Change: [+/- value]
+├─ Large Decrease (-20K+) = Call Unwinding = BULLISH (shorts covering)
+├─ Large Increase (+20K+) = Call Writing = BEARISH (resistance building)
+└─ Flat = Neutral
+
+Put OI Change: [+/- value]
+├─ Large Decrease (-20K+) = Put Unwinding = BEARISH (longs exiting)
+├─ Large Increase (+20K+) = Put Writing = BULLISH (support building)
+└─ Flat = Neutral
+
+**Smart Money Activity:**
+- Which side OI increasing? (Fresh positions)
+- Which side OI decreasing? (Profit booking/Stop loss)
+```
+
+**1.3 OI vs Price Action Matrix:**
+```
+Scenario Check:
+
+Current: Spot Change [+/-]% + Call OI [+/-] + Put OI [+/-]
+
+Match with:
+┌────────────────────────────────────────────────────────┐
+│ Spot↑ + CallOI↓ + PutOI↓ = 🚀 STRONG BULLISH (Short Covering) │
+│ Spot↑ + CallOI↑ + PutOI↓ = 💪 BULLISH (Fresh Long)    │
+│ Spot↑ + CallOI↑ + PutOI↑ = ⚠️ CAUTION (Call Writing)  │
+│ Spot↓ + CallOI↓ + PutOI↑ = 🔻 STRONG BEARISH (Long Exit) │
+│ Spot↓ + CallOI↑ + PutOI↑ = 💀 BEARISH (Fresh Short)   │
+│ Spot~ + CallOI↑ + PutOI↑ = 💣 BIG MOVE COMING (Straddle) │
+└────────────────────────────────────────────────────────┘
+
+**आपली स्थिती:** [Which scenario + interpretation]
+```
+
+**1.4 Strike-wise Changes (Top 5):**
+```
+From "Top 5 Strike Changes" in data:
+
+For each strike:
+- If CE OI decreasing heavily + PE OI increasing = Support forming at this level
+- If PE OI decreasing heavily + CE OI increasing = Resistance forming at this level
+- Largest changes = Most important levels
+
+**Key Strike:** [Which strike shows maximum activity?]
+```
+
+---
+
+## **SECTION 2: PRICE ACTION ANALYSIS**
+
+**2.1 Trend (Last 8 candles = 2 hours):**
+```
+From "CANDLES" data:
+
+Compare first 4 vs last 4 candles:
+- Closes increasing? = Uptrend
+- Closes decreasing? = Downtrend
+- Mixed? = Sideways
+
+Last candle:
+- Green big body = Bullish momentum
+- Red big body = Bearish momentum
+- Small body/Doji = Indecision
+
+**Current Trend:** [Up/Down/Sideways + Strength]
+```
+
+**2.2 Volume Analysis:**
+```
+From volume in candle data:
+
+Last 2-3 candles volume:
+- Volume increasing with green candles = Buying pressure ✅
+- Volume increasing with red candles = Selling pressure ❌
+- Volume decreasing = Weak move ⚠️
+
+**Volume Verdict:** [Strong/Weak/Neutral]
+```
+
+**2.3 Support & Resistance (Price based):**
+```
+Look at candle highs/lows:
+- Repeated highs = Resistance
+- Repeated lows = Support
+- Current spot near which level?
+
+**Position:** [At support/resistance/middle]
+```
+
+---
+
+## **SECTION 3: CONTEXT ANALYSIS**
+
+**3.1 FII/DII Flow:**
+```
+From data:
+FII Net: [value]
+DII Net: [value]
+
+├─ Both positive = Market bullish (buying)
+├─ Both negative = Market bearish (selling)
+├─ FII +ve, DII -ve = FII buying (bullish for market)
+├─ FII -ve, DII +ve = DII absorbing FII selling (neutral to bullish)
+
+**Flow Impact:** [Bullish/Bearish/Neutral]
+```
+
+**3.2 VIX Context:**
+```
+VIX: [value]
+
+├─ >20 = High volatility (option expensive, wide SL needed)
+├─ 15-20 = Normal (balanced trading)
+├─ <15 = Low volatility (option cheap, tight SL ok)
+
+**VIX Signal:** [High/Normal/Low + meaning]
+```
+
+**3.3 News Impact:**
+```
+From NEWS section:
+
+Any major headlines?
+- Positive news + bullish OI = Strong buy
+- Negative news + bearish OI = Strong sell
+- Conflicting = Wait
+
+**News Effect:** [Supportive/Against/Neutral]
+```
+
+---
+
+## **SECTION 4: CONFLUENCE VERDICT**
+
+**4.1 Data Alignment Check:**
+```
+✅ OI sentiment: [Bullish/Bearish/Neutral]
+✅ OI changes (15 min): [Bullish/Bearish/Neutral]
+✅ Price action: [Bullish/Bearish/Neutral]
+✅ Volume: [Strong/Weak]
+✅ FII/DII: [Supportive/Against/Neutral]
+✅ VIX: [Favorable/Unfavorable]
+✅ News: [Supportive/Against/Neutral]
+
+**Alignment Score: [X/7] factors aligned**
+
+Interpretation:
+- 6-7/7 = 🔥 VERY HIGH confidence (सगळे signals एकाच दिशेला)
+- 4-5/7 = ⚠️ MODERATE (कुछ confusion, careful)
+- <4/7 = ❌ NO TRADE (signals मिक्स आहेत)
+```
+
+---
+
+## **SECTION 5: TRADE SETUP (If Opportunity Exists)**
+
+**Only provide if Alignment Score ≥ 5/7 AND OI changes show clear direction**
+
+```
+╔════════════════════════════════════════════════════════════════════════════╗
+║                          🎯 TRADE RECOMMENDATION                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+🎯 OPPORTUNITY: [CE BUY / PE BUY]
+
+📊 ANALYSIS (4-5 lines in Marathi):
+
+**OI Changes:** [काय बदललं last 15 mins मध्ये? Fresh activity कुठे दिसतं?]
+
+**Price Action:** [Candles काय सांगतात? Trend + last candle behavior]
+
+**Volume:** [Volume support करतंय move ला? Strong/Weak]
+
+**Context:** [FII/DII + VIX + News सगळं align आहे का?]
+
+────────────────────────────────────────────────────────────────────────────
+
+💰 TRADE SETUP:
+
+**Entry:** [Strike Price] [CE/PE] @ ₹[LTP]
+
+**Targets:**
+🎯 T1: ₹[Price] (Conservative - book 50%)
+🎯 T2: ₹[Price] (Aggressive - trail SL)
+└─ Risk:Reward = 1:[X]
+
+**Stop Loss:** ₹[Price]
+└─ Reason: [OI level / Pattern invalidation]
+
+**Position Size:** [Small/Medium/Full] (based on confidence)
+
+**Confidence:** ⭐⭐⭐⭐⭐ [X/5 stars]
+
+────────────────────────────────────────────────────────────────────────────
+
+💡 REASON (एका ओळीत):
+"[Why this trade? - OI + Price + Volume + Context in 1 line]"
+
+────────────────────────────────────────────────────────────────────────────
+
+⚠️ INVALIDATION (Exit जर):
+❌ [Specific condition - e.g., "OI reverses / Price breaks support"]
+
+════════════════════════════════════════════════════════════════════════════
+```
+
+---
+
+## **SECTION 6: IF NO TRADE (Output this instead)**
+
+```
+╔════════════════════════════════════════════════════════════════════════════╗
+║                     🚫 NO TRADE ZONE - STAY OUT                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+**REASONS:**
+
+❌ [Specific reason 1 - e.g., "OI changes mixed - no clear direction"]
+❌ [Specific reason 2 - e.g., "Price choppy - no trend"]
+❌ [Specific reason 3 - e.g., "Volume low - weak conviction"]
+
+**Alignment Score:** [X/7] (Need ≥5/7 for trade)
+
+**Wait For:** [काय होणे जरुरी आहे? e.g., "Clear OI unwinding या Price breakout with volume"]
+
+**Next Check:** 15 minutes later
+
+════════════════════════════════════════════════════════════════════════════
+```
+
+═══════════════════════════════════════════════════════════════════════════════
+
+**CRITICAL RULES:**
+
+1. **NEVER force a trade** - NO TRADE बेटर आहे than wrong trade
+2. **OI changes are KING** - जर OI clear signal नाही तर WAIT
+3. **Volume must confirm** - बिना volume ची move = False move
+4. **Confluence is key** - Minimum 5/7 factors align होणे जरुरी
+5. **Be brutally honest** - जर doubt आहे, clearly सांग "NO TRADE"
+6. **Context matters** - High VIX = wider SL, FII selling = be cautious
+7. **Strike changes = Gold** - जिथे सर्वात जास्त OI change, तिथे focus कर
+8. **PCR alone नाही** - PCR + OI changes + Price सगळं बघ
+9. **Confidence <4 stars = NO TRADE**
+10. **Marathi explanations** - Technical terms English, reasoning Marathi
+
+═══════════════════════════════════════════════════════════════════════════════
+
+Now analyze the provided data and give output."""
+
+            payload = {
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": compressed_data}
+                ],
+                "temperature": 0.3,
+                "max_tokens": 800
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.post(self.url, headers=headers, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result['choices'][0]['message']['content']
+            else:
+                logger.error(f"DeepSeek error: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"DeepSeek analysis error: {e}")
+            return None
 
 # ==================== TELEGRAM NOTIFIER ====================
 class TelegramNotifier:
@@ -444,118 +837,52 @@ class TelegramNotifier:
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
     
     async def send_startup(self):
-        msg = f"""🚀 **OPTION CHAIN MONITOR v1.0**
+        msg = f"""🚀 **F&O ANALYSIS BOT + REDIS**
 
 ⏰ {datetime.now(IST).strftime('%d-%b %H:%M IST')}
 
-✅ Every 5 minutes scan
-✅ 21 ATM Strikes (OI, Volume, LTP)
-✅ 15M Chart (Last 400 candles)
+✅ Every 15 minutes
+✅ 37 Symbols (2 Indices + 35 Stocks)
+✅ Redis: OI/Volume tracking (2 hours)
+✅ OI Comparison: Current vs Previous
+✅ DeepSeek V3 Analysis
+✅ Only Buy Opportunities
 
-📊 **Monitoring {len(ALL_SYMBOLS)} Symbols:**
-
-📈 Indices: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'INDEX')}
-🚗 Auto: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'AUTO')}
-🏦 Banks: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'BANK')}
-🏭 Metals: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'METAL')}
-⛽ Oil/Gas: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'OIL_GAS')}
-💻 IT: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'IT')}
-💊 Pharma: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'PHARMA')}
-🛒 FMCG: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'FMCG')}
-⚡ Infra/Power: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') in ['INFRA', 'POWER'])}
-👕 Retail: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'RETAIL')}
-🛡️ Insurance: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'INSURANCE')}
-📱 Others: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') in ['TELECOM', 'FINANCE'])}
-
-🟢 **BOT ACTIVE**"""
-        
+🟢 BOT ACTIVE"""
         await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
     
-    async def send_option_chain_alert(self, symbol: str, display_name: str,
-                                     spot_price: float, strikes: List[StrikeData],
-                                     chart_path: str, expiry: str, category: str):
-        """Send option chain data with chart"""
+    async def send_opportunity(self, symbol: str, chart_path: str, analysis: str):
         try:
-            # Send chart first
+            if "NO TRADE" in analysis or "🚫" in analysis:
+                logger.info(f"  ⏭️ No opportunity: {symbol}")
+                return
+            
             with open(chart_path, 'rb') as photo:
                 await self.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=photo)
             
-            # Calculate PCR
-            total_ce_oi = sum(s.ce_oi for s in strikes)
-            total_pe_oi = sum(s.pe_oi for s in strikes)
-            pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
-            
-            # Category emoji
-            category_emoji = {
-                "INDEX": "📈", "AUTO": "🚗", "BANK": "🏦", "METAL": "🏭",
-                "OIL_GAS": "⛽", "IT": "💻", "PHARMA": "💊", "FMCG": "🛒",
-                "INFRA": "⚡", "POWER": "⚡", "RETAIL": "👕", "INSURANCE": "🛡️",
-                "TELECOM": "📱", "FINANCE": "💰"
-            }.get(category, "📊")
-            
-            # Build message
             msg = f"""━━━━━━━━━━━━━━━━━━━━━━
-{category_emoji} **{display_name}**
+💰 **{symbol}** - OPPORTUNITY
 ━━━━━━━━━━━━━━━━━━━━━━
 
-💹 **Spot:** ₹{spot_price:.2f}
-📅 **Expiry:** {expiry}
-📈 **PCR:** {pcr:.3f}
-
-━━━━━━━━━━━━━━━━━━━━━━
-🔢 **OPTION CHAIN (21 ATM Strikes)**
-━━━━━━━━━━━━━━━━━━━━━━
-
-```
-Strike | CE-OI    | CE-Vol  | CE-LTP | PE-LTP | PE-Vol  | PE-OI
--------|----------|---------|--------|--------|---------|----------
-"""
-            
-            # Add strike data
-            for strike in strikes:
-                ce_oi_str = f"{strike.ce_oi:>8,}" if strike.ce_oi > 0 else "       -"
-                pe_oi_str = f"{strike.pe_oi:>8,}" if strike.pe_oi > 0 else "       -"
-                ce_vol_str = f"{strike.ce_volume:>7,}" if strike.ce_volume > 0 else "      -"
-                pe_vol_str = f"{strike.pe_volume:>7,}" if strike.pe_volume > 0 else "      -"
-                ce_ltp_str = f"{strike.ce_ltp:>6.2f}" if strike.ce_ltp > 0 else "     -"
-                pe_ltp_str = f"{strike.pe_ltp:>6.2f}" if strike.pe_ltp > 0 else "     -"
-                
-                # Highlight ATM strike
-                if abs(strike.strike - spot_price) < 50:
-                    strike_str = f"*{strike.strike:>6}*"
-                else:
-                    strike_str = f"{strike.strike:>6}"
-                
-                msg += f"{strike_str} | {ce_oi_str} | {ce_vol_str} | {ce_ltp_str} | {pe_ltp_str} | {pe_vol_str} | {pe_oi_str}\n"
-            
-            msg += f"""```
-
-━━━━━━━━━━━━━━━━━━━━━━
-📊 **SUMMARY**
-━━━━━━━━━━━━━━━━━━━━━━
-
-**Total CE OI:** {total_ce_oi:,}
-**Total PE OI:** {total_pe_oi:,}
-**PCR:** {pcr:.3f}
+{analysis}
 
 🕐 {datetime.now(IST).strftime('%d-%b %H:%M IST')}
 ━━━━━━━━━━━━━━━━━━━━━━"""
             
             await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
-            logger.info(f"  ✅ Alert sent: {display_name}")
+            logger.info(f"  ✅ Opportunity sent: {symbol}")
             
         except Exception as e:
             logger.error(f"Telegram error: {e}")
-            traceback.print_exc()
 
 # ==================== MAIN BOT ====================
-class OptionMonitorBot:
+class FOAnalyzerBot:
     def __init__(self):
-        logger.info("🔄 Initializing Option Monitor v1.0...")
-        
-        self.fetcher = UpstoxDataFetcher()
+        logger.info("🔄 Initializing F&O Analyzer Bot with Redis...")
+        self.fetcher = DataFetcher()
+        self.analyzer = DeepSeekAnalyzer()
         self.notifier = TelegramNotifier()
-        
+        self.redis_manager = RedisManager()
         logger.info("✅ Bot ready")
     
     def is_market_open(self) -> bool:
@@ -565,87 +892,93 @@ class OptionMonitorBot:
         current_time = now.time()
         return time(9, 15) <= current_time <= time(15, 30)
     
-    async def analyze_symbol(self, instrument_key: str, symbol_info: Dict):
+    async def analyze_symbol(self, instrument_key: str, symbol_info: Dict, market_context: MarketContext):
         try:
             symbol_name = symbol_info.get('name', '')
             display_name = symbol_info.get('display_name', symbol_name)
-            category = symbol_info.get('category', 'OTHER')
             
-            logger.info(f"\n{'='*70}")
-            logger.info(f"🔍 {display_name} ({category})")
-            logger.info(f"{'='*70}")
+            logger.info(f"\n{'='*60}")
+            logger.info(f"🔍 {display_name}")
+            logger.info(f"{'='*60}")
             
-            # Get expiry
-            expiry_api = ExpiryCalculator.get_best_expiry(instrument_key, symbol_info)
-            expiry_display = ExpiryCalculator.get_display_expiry(expiry_api)
-            logger.info(f"  📅 Expiry: {expiry_display}")
+            expiry = ExpiryCalculator.get_best_expiry(instrument_key, symbol_info)
             
-            # Get spot price
-            spot_price = self.fetcher.get_spot_price(instrument_key)
-            if spot_price == 0:
+            spot = self.fetcher.get_spot_price(instrument_key)
+            if spot == 0:
                 logger.warning(f"  ❌ No spot price")
                 return
+            logger.info(f"  💹 Spot: ₹{spot:.2f}")
             
-            logger.info(f"  💹 Spot: ₹{spot_price:.2f}")
-            
-            # Get 15M chart data (last 400 candles)
-            df_15m = self.fetcher.get_15m_data(instrument_key, candles_needed=400)
-            if df_15m is None or len(df_15m) == 0:
-                logger.warning(f"  ⚠️ No 15M data")
+            candles = self.fetcher.get_candlestick_data(instrument_key)
+            if candles is None or len(candles) == 0:
+                logger.warning(f"  ⚠️ No candle data")
                 return
+            logger.info(f"  📊 Candles: {len(candles)}")
             
-            logger.info(f"  📊 15M Candles: {len(df_15m)}")
-            
-            # Get option chain
-            all_strikes = self.fetcher.get_option_chain(instrument_key, expiry_api)
-            if not all_strikes:
-                logger.warning(f"  ⚠️ No option chain data")
+            strikes = self.fetcher.get_option_chain(instrument_key, expiry)
+            if not strikes:
+                logger.warning(f"  ⚠️ No option chain")
                 return
+            logger.info(f"  🎯 Strikes: {len(strikes)}")
             
-            # Get 21 ATM strikes (10 below + ATM + 10 above)
-            atm = round(spot_price / 100) * 100
+            # Calculate OI snapshot
+            atm = round(spot / 100) * 100
+            atm_strikes = [s for s in strikes if abs(s.strike - atm) <= 1000][:21]
             
-            # Define strike range based on symbol type
-            if category == "INDEX":
-                strike_interval = 100
-                strikes_count = 10
+            total_ce_oi = sum(s.ce_oi for s in atm_strikes)
+            total_pe_oi = sum(s.pe_oi for s in atm_strikes)
+            total_ce_volume = sum(s.ce_volume for s in atm_strikes)
+            total_pe_volume = sum(s.pe_volume for s in atm_strikes)
+            pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+            
+            current_snapshot = OISnapshot(
+                timestamp=datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S'),
+                spot_price=spot,
+                strikes=[{
+                    'strike': s.strike,
+                    'ce_oi': s.ce_oi,
+                    'pe_oi': s.pe_oi,
+                    'ce_volume': s.ce_volume,
+                    'pe_volume': s.pe_volume
+                } for s in atm_strikes],
+                pcr=pcr,
+                total_ce_oi=total_ce_oi,
+                total_pe_oi=total_pe_oi,
+                total_ce_volume=total_ce_volume,
+                total_pe_volume=total_pe_volume
+            )
+            
+            # Compare with previous scan
+            oi_comparison = self.redis_manager.compare_oi_changes(symbol_name, current_snapshot)
+            
+            if oi_comparison['has_previous']:
+                logger.info(f"  📊 OI Changes: CE {oi_comparison['ce_oi_change']:+,}, PE {oi_comparison['pe_oi_change']:+,}")
+                logger.info(f"  📈 Spot Change: {oi_comparison['spot_change']:+.2f} ({oi_comparison['spot_change_pct']:+.2f}%)")
             else:
-                strike_interval = 50 if spot_price < 2000 else 100
-                strikes_count = 10
+                logger.info(f"  📊 First scan - no previous data")
             
-            atm_strikes = []
-            for i in range(-strikes_count, strikes_count + 1):
-                target_strike = atm + (i * strike_interval)
-                # Find closest strike
-                matching_strike = min(all_strikes, 
-                                    key=lambda x: abs(x.strike - target_strike),
-                                    default=None)
-                if matching_strike and matching_strike not in atm_strikes:
-                    atm_strikes.append(matching_strike)
-            
-            # Sort strikes
-            atm_strikes = sorted(atm_strikes, key=lambda x: x.strike)[:21]
-            
-            if not atm_strikes:
-                logger.warning(f"  ⚠️ No ATM strikes found")
-                return
-            
-            logger.info(f"  🎯 ATM Strikes: {len(atm_strikes)}")
+            # Save current snapshot to Redis
+            self.redis_manager.save_oi_snapshot(symbol_name, current_snapshot)
             
             # Generate chart
-            chart_path = f"/tmp/{symbol_name}_option_monitor.png"
-            ChartGenerator.create_candlestick_chart(
-                display_name, df_15m, spot_price, category, chart_path
-            )
-            logger.info(f"  📊 Chart generated")
+            chart_path = f"/tmp/{symbol_name}_chart.png"
+            ChartGenerator.create_chart(display_name, candles, spot, chart_path)
             
-            # Send alert
-            await self.notifier.send_option_chain_alert(
-                symbol_name, display_name, spot_price,
-                atm_strikes, chart_path, expiry_display, category
+            # Compress data
+            compressed = self.analyzer.compress_data(
+                symbol_name, spot, candles, strikes, market_context, expiry, oi_comparison
             )
+            logger.info(f"  🗜️ Data compressed")
             
-            logger.info(f"  ✅ Analysis complete")
+            # Analyze with DeepSeek
+            logger.info(f"  🤖 Analyzing with DeepSeek V3...")
+            analysis = self.analyzer.analyze(compressed)
+            
+            if analysis:
+                logger.info(f"  ✅ Analysis received")
+                await self.notifier.send_opportunity(display_name, chart_path, analysis)
+            else:
+                logger.warning(f"  ❌ Analysis failed")
             
         except Exception as e:
             logger.error(f"Analysis error for {symbol_info.get('display_name')}: {e}")
@@ -653,14 +986,34 @@ class OptionMonitorBot:
     
     async def run_scan(self):
         logger.info(f"\n{'='*80}")
-        logger.info(f"🔄 SCAN - {datetime.now(IST).strftime('%H:%M:%S IST')}")
+        logger.info(f"🔄 SCAN START - {datetime.now(IST).strftime('%H:%M:%S IST')}")
         logger.info(f"{'='*80}")
+        
+        logger.info("\n📊 Fetching Market Context...")
+        fii_dii = self.fetcher.get_fii_dii_data()
+        vix = self.fetcher.get_vix()
+        news = self.fetcher.get_market_news()
+        
+        market_context = MarketContext(
+            fii_buy=fii_dii['fii_buy'],
+            fii_sell=fii_dii['fii_sell'],
+            fii_net=fii_dii['fii_net'],
+            dii_buy=fii_dii['dii_buy'],
+            dii_sell=fii_dii['dii_sell'],
+            dii_net=fii_dii['dii_net'],
+            vix=vix,
+            news_headlines=news
+        )
+        
+        logger.info(f"  VIX: {vix:.2f}")
+        logger.info(f"  FII Net: ₹{fii_dii['fii_net']:.0f} Cr")
+        logger.info(f"  DII Net: ₹{fii_dii['dii_net']:.0f} Cr")
+        logger.info(f"  News: {len(news)} headlines")
         
         for idx, (key, info) in enumerate(ALL_SYMBOLS.items(), 1):
             logger.info(f"\n[{idx}/{len(ALL_SYMBOLS)}]")
-            await self.analyze_symbol(key, info)
+            await self.analyze_symbol(key, info, market_context)
             
-            # Wait between symbols to avoid rate limits
             if idx < len(ALL_SYMBOLS):
                 await asyncio.sleep(2)
         
@@ -670,17 +1023,18 @@ class OptionMonitorBot:
     
     async def run(self):
         logger.info("="*80)
-        logger.info("OPTION CHAIN MONITOR v1.0")
+        logger.info("F&O ANALYSIS BOT WITH REDIS + DEEPSEEK V3")
         logger.info("="*80)
         
-        if not all([UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
-            logger.error("❌ Missing credentials!")
+        if not all([UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DEEPSEEK_API_KEY]):
+            logger.error("❌ Missing API credentials!")
+            logger.error("Required: UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DEEPSEEK_API_KEY")
             return
         
         await self.notifier.send_startup()
         
         logger.info("="*80)
-        logger.info("🟢 RUNNING - Every 5 minutes")
+        logger.info("🟢 RUNNING - Every 15 minutes with Redis OI tracking")
         logger.info("="*80)
         
         while True:
@@ -692,7 +1046,7 @@ class OptionMonitorBot:
                 
                 await self.run_scan()
                 
-                logger.info(f"⏳ Next scan in 5 minutes...")
+                logger.info(f"⏳ Next scan in 15 minutes...")
                 await asyncio.sleep(SCAN_INTERVAL)
                 
             except KeyboardInterrupt:
@@ -706,7 +1060,7 @@ class OptionMonitorBot:
 # ==================== ENTRY POINT ====================
 async def main():
     try:
-        bot = OptionMonitorBot()
+        bot = FOAnalyzerBot()
         await bot.run()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
@@ -714,7 +1068,7 @@ async def main():
 
 if __name__ == "__main__":
     logger.info("="*80)
-    logger.info("STARTING OPTION CHAIN MONITOR v1.0")
+    logger.info("STARTING F&O ANALYSIS BOT WITH REDIS")
     logger.info("="*80)
     
     try:
