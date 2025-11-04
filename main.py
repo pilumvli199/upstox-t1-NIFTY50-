@@ -1,68 +1,59 @@
-import telebot
-import pandas as pd
-import feedparser
-import requests
+import telebot, pandas as pd, feedparser, requests, os, time, threading
 from datetime import datetime
-import time
-import threading
-import os
 
-TOKEN = os.getenv('BOT_TOKEN')
-CHAT_ID = os.getenv('CHAT_ID')
+# तुझ्या नावानुसारच घेतो!
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+# चेक करतो की टोकन आलाय का
+if not TOKEN or not CHAT_ID:
+    print("ERROR: TELEGRAM_BOT_TOKEN किंवा TELEGRAM_CHAT_ID सेट करा!")
+    exit()
+else:
+    print("TOKEN & CHAT_ID मिळाले! Bot चालू...")
+
 bot = telebot.TeleBot(TOKEN)
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Referer": "https://www.nseindia.com/"
-})
+# NSE सेशन
+s = requests.Session()
+s.headers.update({"User-Agent": "Mozilla/5.0", "Referer": "https://www.nseindia.com/"})
 
-# १. FII/DII
+# FII/DII
 def get_fiidii():
     try:
-        date_str = datetime.now().strftime('%d-%b-%Y').upper()
-        url = f"https://www.nseindia.com/archives/equities/fiidii/{date_str}.csv"
-        resp = session.get(url, timeout=10)
-        if resp.status_code != 200:
-            return "❌ FII/DII डेटा अजून नाही."
-        df = pd.read_csv(resp.text.splitlines())
-        row = df.iloc[0]
-        return f"💰 FII: *₹{row['FII Net (Cr)']:,.0f} Cr* | 🏦 DII: *₹{row['DII Net (Cr)']:,.0f} Cr*"
-    except: return "❌ FII/DII Error"
+        d = datetime.now().strftime('%d-%b-%Y').upper()
+        url = f"https://www.nseindia.com/archives/equities/fiidii/{d}.csv"
+        r = s.get(url, timeout=10)
+        if r.status_code != 200: return "डेटा येणार नाही (7:45 नंतर बघ)"
+        df = pd.read_csv(r.text.splitlines())
+        f = df.iloc[0]
+        return f"FII: *₹{f['FII Net (Cr)']:,.0f} Cr*\nDII: *₹{f['DII Net (Cr)']:,.0f} Cr*"
+    except: return "FII/DII Error"
 
-# २. Sensex & Nifty (NSE JSON API - 100% रियल!)
+# Sensex + Nifty
 def get_indices():
     try:
-        url = "https://www.nseindia.com/api/quote-equity?symbol=%5ENSEI"  # Sensex
-        data = session.get("https://www.nseindia.com/", timeout=10)  # cookie
-        j = session.get(url).json()
-        sensex = j['priceInfo']['lastPrice']
-        sensex_chg = j['priceInfo']['change']
-        sensex_pchg = j['priceInfo']['pChange']
+        j1 = s.get("https://www.nseindia.com/api/quote-equity?symbol=%5ENSEI").json()
+        sx = j1['priceInfo']['lastPrice']
+        sp = j1['priceInfo']['pChange']
+        j2 = s.get("https://www.nseindia.com/api/quote-equity?symbol=%5ENIFTY%2050").json()
+        nf = j2['priceInfo']['lastPrice']
+        np = j2['priceInfo']['pChange']
+        return f"Sensex: {sx:,.0f} ({sp:+.2f}%)\nNifty: {nf:,.0f} ({np:+.2f}%)"
+    except: return "Indices बंद (मार्केट 3:30 वाजता बंद)"
 
-        url2 = "https://www.nseindia.com/api/quote-equity?symbol=%5ENIFTY%2050"
-        j2 = session.get(url2).json()
-        nifty = j2['priceInfo']['lastPrice']
-        nifty_chg = j2['priceInfo']['change']
-        nifty_pchg = j2['priceInfo']['pChange']
-
-        return (f"📈 *Sensex*: {sensex:,.0f} ({sensex_chg:+.0f} | {sensex_pchg:+.2f}%)\n"
-                f"📊 *Nifty*: {nifty:,.0f} ({nifty_chg:+.0f} | {nifty_pchg:+.2f}%)")
-    except:
-        return "❌ Indices डेटा लोड होत नाही (मार्केट बंद असेल)"
-
-# ३. न्यूज
+# न्यूज
 def get_news():
     feed = feedparser.parse("https://www.moneycontrol.com/news/rss")
-    msg = "📰 *टॉप ३ Sensex/Nifty न्यूज*\n\n"
-    for i, entry in enumerate(feed.entries[:3]):
-        msg += f"{i+1}. {entry.title}\n🔗 {entry.link}\n\n"
+    msg = "टॉप ३ न्यूज\n\n"
+    for e in feed.entries[:3]:
+        msg += f"• {e.title}\n{e.link}\n\n"
     return msg
 
 # कमांड्स
 @bot.message_handler(commands=['start'])
 def start(m):
-    bot.reply_to(m, "🚀 नवीन अपडेट!\n/fiidii | /sensex | /nifty | /news")
+    bot.reply_to(m, "Bot चालू!\n/fiidii\n/sensex\n/news")
 
 @bot.message_handler(commands=['fiidii'])
 def fiidii(m): bot.reply_to(m, get_fiidii(), parse_mode='Markdown')
@@ -70,26 +61,25 @@ def fiidii(m): bot.reply_to(m, get_fiidii(), parse_mode='Markdown')
 @bot.message_handler(commands=['sensex'])
 def sensex(m): bot.reply_to(m, get_indices(), parse_mode='Markdown')
 
-@bot.message_handler(commands=['nifty'])
-def nifty(m): bot.reply_to(m, get_indices(), parse_mode='Markdown')
-
 @bot.message_handler(commands=['news'])
 def news(m): bot.reply_to(m, get_news())
 
-# रोज 7:35 PM ऑटो मेसेज
+# रोज 7:45 PM ऑटो
 def daily_report():
     while True:
         now = datetime.now()
-        if now.hour == 19 and now.minute == 35:
-            msg = f"🌙 *आजचा मार्केट अपडेट* ({now.strftime('%d %b')})\n\n"
+        if now.hour == 19 and now.minute == 45:
+            msg = f"आजचा अपडेट ({now.strftime('%d %b')})\n\n"
             msg += get_fiidii() + "\n\n"
             msg += get_indices() + "\n\n"
             msg += get_news()
             bot.send_message(CHAT_ID, msg, parse_mode='Markdown', disable_web_page_preview=True)
+            print("7:45 PM चा मेसेज पाठवला!")
             time.sleep(70)
         time.sleep(30)
 
+# चालू कर
 if __name__ == "__main__":
-    print("Bot व्हॉट्सअॅप सारखा चालू! 🚀")
     threading.Thread(target=daily_report, daemon=True).start()
+    print("Bot 24×7 चालू! /start करून ट्राय कर")
     bot.infinity_polling()
