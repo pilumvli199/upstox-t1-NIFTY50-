@@ -370,36 +370,18 @@ class DataFetcher:
     def get_candlestick_data(self, instrument_key: str) -> Optional[pd.DataFrame]:
         try:
             encoded_key = urllib.parse.quote(instrument_key, safe='')
-            
-            # Try intraday first
             url = f"{BASE_URL}/v2/historical-candle/intraday/{encoded_key}/15minute"
             response = requests.get(url, headers=self.headers, timeout=20)
-            
             if response.status_code == 200:
                 candles = response.json().get('data', {}).get('candles', [])
-                if candles and len(candles) > 0:
-                    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df = df.set_index('timestamp').astype(float).sort_index()
-                    return df.tail(8)
-            
-            # Fallback: Try daily data (for testing when market closed)
-            logger.warning(f"  ⚠️ No intraday data, trying daily candles...")
-            today = datetime.now(IST).strftime('%Y-%m-%d')
-            url = f"{BASE_URL}/v2/historical-candle/{encoded_key}/day/{today}"
-            response = requests.get(url, headers=self.headers, timeout=20)
-            
-            if response.status_code == 200:
-                candles = response.json().get('data', {}).get('candles', [])
-                if candles and len(candles) > 0:
-                    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df = df.set_index('timestamp').astype(float).sort_index()
-                    return df.tail(8)
-            
+                if not candles:
+                    return None
+                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df.set_index('timestamp').astype(float).sort_index()
+                return df.tail(8)
             return None
-        except Exception as e:
-            logger.error(f"Candle data error: {e}")
+        except:
             return None
     
     def get_vix(self) -> float:
