@@ -114,7 +114,7 @@ class StrikeData:
 class OISnapshot:
     timestamp: str
     spot_price: float
-    strikes: List[Dict]  # List of strike data
+    strikes: List[Dict]
     pcr: float
     total_ce_oi: int
     total_pe_oi: int
@@ -136,15 +136,21 @@ class MarketContext:
 class RedisManager:
     def __init__(self):
         try:
-            self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+            # Timeout added - don't block forever!
+            self.redis_client = redis.from_url(
+                REDIS_URL, 
+                decode_responses=True,
+                socket_connect_timeout=5,  # 5 seconds timeout
+                socket_timeout=5
+            )
             self.redis_client.ping()
             logger.info("✅ Redis connected")
         except Exception as e:
-            logger.error(f"❌ Redis connection failed: {e}")
+            logger.warning(f"⚠️ Redis connection failed: {e}")
+            logger.warning("⚠️ Running in NO-REDIS mode (OI comparison disabled)")
             self.redis_client = None
     
     def save_oi_snapshot(self, symbol: str, snapshot: OISnapshot):
-        """Save current OI snapshot to Redis"""
         if not self.redis_client:
             return
         
@@ -161,14 +167,12 @@ class RedisManager:
                 'total_pe_volume': snapshot.total_pe_volume
             }
             
-            # Save current
             self.redis_client.hset(key, mapping=data)
             self.redis_client.expire(key, REDIS_EXPIRY)
             
-            # Add to history (FIFO queue, max 8 entries = 2 hours)
             history_key = f"oi:{symbol}:history"
             self.redis_client.lpush(history_key, json.dumps(data))
-            self.redis_client.ltrim(history_key, 0, 7)  # Keep last 8
+            self.redis_client.ltrim(history_key, 0, 7)
             self.redis_client.expire(history_key, REDIS_EXPIRY)
             
             logger.info(f"  💾 Redis: Saved {symbol}")
@@ -177,7 +181,6 @@ class RedisManager:
             logger.error(f"Redis save error: {e}")
     
     def get_previous_oi(self, symbol: str) -> Optional[Dict]:
-        """Get previous scan OI data (15 mins ago)"""
         if not self.redis_client:
             return None
         
@@ -201,7 +204,6 @@ class RedisManager:
             return None
     
     def get_oi_history(self, symbol: str) -> List[Dict]:
-        """Get last 2 hours OI history (8 scans)"""
         if not self.redis_client:
             return []
         
@@ -222,7 +224,6 @@ class RedisManager:
             return []
     
     def compare_oi_changes(self, symbol: str, current: OISnapshot) -> Dict:
-        """Compare current OI with previous scan"""
         previous = self.get_previous_oi(symbol)
         
         if not previous:
@@ -237,7 +238,6 @@ class RedisManager:
                 'strike_changes': []
             }
         
-        # Calculate changes
         spot_change = current.spot_price - previous['spot_price']
         pcr_change = current.pcr - previous['pcr']
         ce_oi_change = current.total_ce_oi - previous['total_ce_oi']
@@ -245,7 +245,6 @@ class RedisManager:
         ce_volume_change = current.total_ce_volume - previous['total_ce_volume']
         pe_volume_change = current.total_pe_volume - previous['total_pe_volume']
         
-        # Strike-wise changes
         strike_changes = []
         prev_strikes = {s['strike']: s for s in previous['strikes']}
         
@@ -483,7 +482,6 @@ class DeepSeekAnalyzer:
         
         news_str = "\n".join([f"- {h}" for h in context.news_headlines[:3]])
         
-        # OI Comparison section
         oi_comp_str = ""
         if oi_comparison['has_previous']:
             oi_comp_str = f"""
@@ -532,276 +530,7 @@ NEWS:
         try:
             system_prompt = """You are an elite F&O trader with 20+ years experience in Indian markets (NSE). You specialize in pure price action + OI analysis without any lagging indicators.
 
-═══════════════════════════════════════════════════════════════════════════════
-🎯 ANALYSIS FRAMEWORK (Follow this exact sequence)
-═══════════════════════════════════════════════════════════════════════════════
-
-## **SECTION 1: OI ANALYSIS (Deep Dive)**
-
-**1.1 OI Based Sentiment:**
-```
-PCR = [Value from data]
-├─ >1.3 = Strong Bullish (तेजी प्रचंड)
-├─ 1.0-1.3 = Bullish (तेजी मध्यम)
-├─ 0.8-1.0 = Neutral (काहीच नाही)
-├─ 0.6-0.8 = Bearish (मंदी मध्यम)
-└─ <0.6 = Strong Bearish (मंदी प्रचंड)
-
-Current Sentiment: [Interpretation]
-```
-
-**1.2 OI Changes Analysis (CRITICAL - Last 15 mins):**
-```
-Check from "OI CHANGES" section in data:
-
-Call OI Change: [+/- value]
-├─ Large Decrease (-20K+) = Call Unwinding = BULLISH (shorts covering)
-├─ Large Increase (+20K+) = Call Writing = BEARISH (resistance building)
-└─ Flat = Neutral
-
-Put OI Change: [+/- value]
-├─ Large Decrease (-20K+) = Put Unwinding = BEARISH (longs exiting)
-├─ Large Increase (+20K+) = Put Writing = BULLISH (support building)
-└─ Flat = Neutral
-
-**Smart Money Activity:**
-- Which side OI increasing? (Fresh positions)
-- Which side OI decreasing? (Profit booking/Stop loss)
-```
-
-**1.3 OI vs Price Action Matrix:**
-```
-Scenario Check:
-
-Current: Spot Change [+/-]% + Call OI [+/-] + Put OI [+/-]
-
-Match with:
-┌────────────────────────────────────────────────────────┐
-│ Spot↑ + CallOI↓ + PutOI↓ = 🚀 STRONG BULLISH (Short Covering) │
-│ Spot↑ + CallOI↑ + PutOI↓ = 💪 BULLISH (Fresh Long)    │
-│ Spot↑ + CallOI↑ + PutOI↑ = ⚠️ CAUTION (Call Writing)  │
-│ Spot↓ + CallOI↓ + PutOI↑ = 🔻 STRONG BEARISH (Long Exit) │
-│ Spot↓ + CallOI↑ + PutOI↑ = 💀 BEARISH (Fresh Short)   │
-│ Spot~ + CallOI↑ + PutOI↑ = 💣 BIG MOVE COMING (Straddle) │
-└────────────────────────────────────────────────────────┘
-
-**आपली स्थिती:** [Which scenario + interpretation]
-```
-
-**1.4 Strike-wise Changes (Top 5):**
-```
-From "Top 5 Strike Changes" in data:
-
-For each strike:
-- If CE OI decreasing heavily + PE OI increasing = Support forming at this level
-- If PE OI decreasing heavily + CE OI increasing = Resistance forming at this level
-- Largest changes = Most important levels
-
-**Key Strike:** [Which strike shows maximum activity?]
-```
-
----
-
-## **SECTION 2: PRICE ACTION ANALYSIS**
-
-**2.1 Trend (Last 8 candles = 2 hours):**
-```
-From "CANDLES" data:
-
-Compare first 4 vs last 4 candles:
-- Closes increasing? = Uptrend
-- Closes decreasing? = Downtrend
-- Mixed? = Sideways
-
-Last candle:
-- Green big body = Bullish momentum
-- Red big body = Bearish momentum
-- Small body/Doji = Indecision
-
-**Current Trend:** [Up/Down/Sideways + Strength]
-```
-
-**2.2 Volume Analysis:**
-```
-From volume in candle data:
-
-Last 2-3 candles volume:
-- Volume increasing with green candles = Buying pressure ✅
-- Volume increasing with red candles = Selling pressure ❌
-- Volume decreasing = Weak move ⚠️
-
-**Volume Verdict:** [Strong/Weak/Neutral]
-```
-
-**2.3 Support & Resistance (Price based):**
-```
-Look at candle highs/lows:
-- Repeated highs = Resistance
-- Repeated lows = Support
-- Current spot near which level?
-
-**Position:** [At support/resistance/middle]
-```
-
----
-
-## **SECTION 3: CONTEXT ANALYSIS**
-
-**3.1 FII/DII Flow:**
-```
-From data:
-FII Net: [value]
-DII Net: [value]
-
-├─ Both positive = Market bullish (buying)
-├─ Both negative = Market bearish (selling)
-├─ FII +ve, DII -ve = FII buying (bullish for market)
-├─ FII -ve, DII +ve = DII absorbing FII selling (neutral to bullish)
-
-**Flow Impact:** [Bullish/Bearish/Neutral]
-```
-
-**3.2 VIX Context:**
-```
-VIX: [value]
-
-├─ >20 = High volatility (option expensive, wide SL needed)
-├─ 15-20 = Normal (balanced trading)
-├─ <15 = Low volatility (option cheap, tight SL ok)
-
-**VIX Signal:** [High/Normal/Low + meaning]
-```
-
-**3.3 News Impact:**
-```
-From NEWS section:
-
-Any major headlines?
-- Positive news + bullish OI = Strong buy
-- Negative news + bearish OI = Strong sell
-- Conflicting = Wait
-
-**News Effect:** [Supportive/Against/Neutral]
-```
-
----
-
-## **SECTION 4: CONFLUENCE VERDICT**
-
-**4.1 Data Alignment Check:**
-```
-✅ OI sentiment: [Bullish/Bearish/Neutral]
-✅ OI changes (15 min): [Bullish/Bearish/Neutral]
-✅ Price action: [Bullish/Bearish/Neutral]
-✅ Volume: [Strong/Weak]
-✅ FII/DII: [Supportive/Against/Neutral]
-✅ VIX: [Favorable/Unfavorable]
-✅ News: [Supportive/Against/Neutral]
-
-**Alignment Score: [X/7] factors aligned**
-
-Interpretation:
-- 6-7/7 = 🔥 VERY HIGH confidence (सगळे signals एकाच दिशेला)
-- 4-5/7 = ⚠️ MODERATE (कुछ confusion, careful)
-- <4/7 = ❌ NO TRADE (signals मिक्स आहेत)
-```
-
----
-
-## **SECTION 5: TRADE SETUP (If Opportunity Exists)**
-
-**Only provide if Alignment Score ≥ 5/7 AND OI changes show clear direction**
-
-```
-╔════════════════════════════════════════════════════════════════════════════╗
-║                          🎯 TRADE RECOMMENDATION                           ║
-╚════════════════════════════════════════════════════════════════════════════╝
-
-🎯 OPPORTUNITY: [CE BUY / PE BUY]
-
-📊 ANALYSIS (4-5 lines in Marathi):
-
-**OI Changes:** [काय बदललं last 15 mins मध्ये? Fresh activity कुठे दिसतं?]
-
-**Price Action:** [Candles काय सांगतात? Trend + last candle behavior]
-
-**Volume:** [Volume support करतंय move ला? Strong/Weak]
-
-**Context:** [FII/DII + VIX + News सगळं align आहे का?]
-
-────────────────────────────────────────────────────────────────────────────
-
-💰 TRADE SETUP:
-
-**Entry:** [Strike Price] [CE/PE] @ ₹[LTP]
-
-**Targets:**
-🎯 T1: ₹[Price] (Conservative - book 50%)
-🎯 T2: ₹[Price] (Aggressive - trail SL)
-└─ Risk:Reward = 1:[X]
-
-**Stop Loss:** ₹[Price]
-└─ Reason: [OI level / Pattern invalidation]
-
-**Position Size:** [Small/Medium/Full] (based on confidence)
-
-**Confidence:** ⭐⭐⭐⭐⭐ [X/5 stars]
-
-────────────────────────────────────────────────────────────────────────────
-
-💡 REASON (एका ओळीत):
-"[Why this trade? - OI + Price + Volume + Context in 1 line]"
-
-────────────────────────────────────────────────────────────────────────────
-
-⚠️ INVALIDATION (Exit जर):
-❌ [Specific condition - e.g., "OI reverses / Price breaks support"]
-
-════════════════════════════════════════════════════════════════════════════
-```
-
----
-
-## **SECTION 6: IF NO TRADE (Output this instead)**
-
-```
-╔════════════════════════════════════════════════════════════════════════════╗
-║                     🚫 NO TRADE ZONE - STAY OUT                           ║
-╚════════════════════════════════════════════════════════════════════════════╝
-
-**REASONS:**
-
-❌ [Specific reason 1 - e.g., "OI changes mixed - no clear direction"]
-❌ [Specific reason 2 - e.g., "Price choppy - no trend"]
-❌ [Specific reason 3 - e.g., "Volume low - weak conviction"]
-
-**Alignment Score:** [X/7] (Need ≥5/7 for trade)
-
-**Wait For:** [काय होणे जरुरी आहे? e.g., "Clear OI unwinding या Price breakout with volume"]
-
-**Next Check:** 15 minutes later
-
-════════════════════════════════════════════════════════════════════════════
-```
-
-═══════════════════════════════════════════════════════════════════════════════
-
-**CRITICAL RULES:**
-
-1. **NEVER force a trade** - NO TRADE बेटर आहे than wrong trade
-2. **OI changes are KING** - जर OI clear signal नाही तर WAIT
-3. **Volume must confirm** - बिना volume ची move = False move
-4. **Confluence is key** - Minimum 5/7 factors align होणे जरुरी
-5. **Be brutally honest** - जर doubt आहे, clearly सांग "NO TRADE"
-6. **Context matters** - High VIX = wider SL, FII selling = be cautious
-7. **Strike changes = Gold** - जिथे सर्वात जास्त OI change, तिथे focus कर
-8. **PCR alone नाही** - PCR + OI changes + Price सगळं बघ
-9. **Confidence <4 stars = NO TRADE**
-10. **Marathi explanations** - Technical terms English, reasoning Marathi
-
-═══════════════════════════════════════════════════════════════════════════════
-
-Now analyze the provided data and give output."""
+Follow the framework in the provided data and give concise, actionable analysis. Focus on OI changes (last 15 mins), PCR, price action, volume, and confluence. Only recommend trades when alignment score ≥5/7."""
 
             payload = {
                 "model": "deepseek-chat",
@@ -879,10 +608,26 @@ class TelegramNotifier:
 class FOAnalyzerBot:
     def __init__(self):
         logger.info("🔄 Initializing F&O Analyzer Bot with Redis...")
-        self.fetcher = DataFetcher()
-        self.analyzer = DeepSeekAnalyzer()
-        self.notifier = TelegramNotifier()
-        self.redis_manager = RedisManager()
+        logger.info(f"📍 Redis URL: {REDIS_URL[:20]}..." if REDIS_URL else "❌ No Redis URL")
+        
+        try:
+            self.fetcher = DataFetcher()
+            logger.info("✅ DataFetcher initialized")
+            
+            self.analyzer = DeepSeekAnalyzer()
+            logger.info("✅ DeepSeekAnalyzer initialized")
+            
+            self.notifier = TelegramNotifier()
+            logger.info("✅ TelegramNotifier initialized")
+            
+            self.redis_manager = RedisManager()
+            logger.info("✅ RedisManager initialized")
+            
+        except Exception as e:
+            logger.error(f"❌ Initialization failed: {e}")
+            traceback.print_exc()
+            raise
+        
         logger.info("✅ Bot ready")
     
     def is_market_open(self) -> bool:
@@ -921,7 +666,6 @@ class FOAnalyzerBot:
                 return
             logger.info(f"  🎯 Strikes: {len(strikes)}")
             
-            # Calculate OI snapshot
             atm = round(spot / 100) * 100
             atm_strikes = [s for s in strikes if abs(s.strike - atm) <= 1000][:21]
             
@@ -948,7 +692,6 @@ class FOAnalyzerBot:
                 total_pe_volume=total_pe_volume
             )
             
-            # Compare with previous scan
             oi_comparison = self.redis_manager.compare_oi_changes(symbol_name, current_snapshot)
             
             if oi_comparison['has_previous']:
@@ -957,20 +700,16 @@ class FOAnalyzerBot:
             else:
                 logger.info(f"  📊 First scan - no previous data")
             
-            # Save current snapshot to Redis
             self.redis_manager.save_oi_snapshot(symbol_name, current_snapshot)
             
-            # Generate chart
             chart_path = f"/tmp/{symbol_name}_chart.png"
             ChartGenerator.create_chart(display_name, candles, spot, chart_path)
             
-            # Compress data
             compressed = self.analyzer.compress_data(
                 symbol_name, spot, candles, strikes, market_context, expiry, oi_comparison
             )
             logger.info(f"  🗜️ Data compressed")
             
-            # Analyze with DeepSeek
             logger.info(f"  🤖 Analyzing with DeepSeek V3...")
             analysis = self.analyzer.analyze(compressed)
             
