@@ -370,18 +370,36 @@ class DataFetcher:
     def get_candlestick_data(self, instrument_key: str) -> Optional[pd.DataFrame]:
         try:
             encoded_key = urllib.parse.quote(instrument_key, safe='')
+            
+            # Try intraday first
             url = f"{BASE_URL}/v2/historical-candle/intraday/{encoded_key}/15minute"
             response = requests.get(url, headers=self.headers, timeout=20)
+            
             if response.status_code == 200:
                 candles = response.json().get('data', {}).get('candles', [])
-                if not candles:
-                    return None
-                df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                df = df.set_index('timestamp').astype(float).sort_index()
-                return df.tail(8)
+                if candles and len(candles) > 0:
+                    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df = df.set_index('timestamp').astype(float).sort_index()
+                    return df.tail(8)
+            
+            # Fallback: Try daily data (for testing when market closed)
+            logger.warning(f"  ⚠️ No intraday data, trying daily candles...")
+            today = datetime.now(IST).strftime('%Y-%m-%d')
+            url = f"{BASE_URL}/v2/historical-candle/{encoded_key}/day/{today}"
+            response = requests.get(url, headers=self.headers, timeout=20)
+            
+            if response.status_code == 200:
+                candles = response.json().get('data', {}).get('candles', [])
+                if candles and len(candles) > 0:
+                    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df = df.set_index('timestamp').astype(float).sort_index()
+                    return df.tail(8)
+            
             return None
-        except:
+        except Exception as e:
+            logger.error(f"Candle data error: {e}")
             return None
     
     def get_vix(self) -> float:
@@ -631,11 +649,24 @@ class FOAnalyzerBot:
         logger.info("✅ Bot ready")
     
     def is_market_open(self) -> bool:
+        # Force IST timezone
         now = datetime.now(IST)
+        
+        # Debug log
+        logger.info(f"  🕐 Current IST Time: {now.strftime('%H:%M:%S')} | Day: {now.strftime('%A')}")
+        
+        # Weekend check
         if now.weekday() >= 5:
+            logger.info(f"  ⏸️ Weekend - Market Closed")
             return False
+        
         current_time = now.time()
-        return time(9, 15) <= current_time <= time(15, 30)
+        market_open = time(9, 15) <= current_time <= time(15, 30)
+        
+        if not market_open:
+            logger.info(f"  ⏸️ Market Hours: 9:15 AM - 3:30 PM | Current: {current_time.strftime('%H:%M')}")
+        
+        return market_open
     
     async def analyze_symbol(self, instrument_key: str, symbol_info: Dict, market_context: MarketContext):
         try:
