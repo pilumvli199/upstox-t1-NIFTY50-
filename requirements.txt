@@ -1,2 +1,31 @@
-python-telegram-bot==21.5
+# H-LIQUIDITY WALT Trading System - Requirements
+# Python 3.9+
+
+# Core Dependencies
 requests==2.31.0
+python-telegram-bot==20.7
+redis==5.0.1
+pandas==2.1.4
+numpy==1.26.2
+
+# Timezone Support
+pytz==2023.3
+
+# Plotting
+matplotlib==3.8.2
+
+# Data Classes (built-in for Python 3.7+, but explicit for clarity)
+dataclasses-json==0.6.3
+
+# Async Support (built-in, but good to specify)
+asyncio==3.4.3
+
+# Logging (built-in)
+# logging - built-in module
+
+# Optional: For better error tracking
+# sentry-sdk==1.39.1
+
+# Development/Testing (Optional)
+# pytest==7.4.3
+# pytest-asyncio==0.21.1
