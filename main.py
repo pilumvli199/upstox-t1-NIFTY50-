@@ -945,38 +945,37 @@ class SensexBot:
     async def send_startup_message(self):
         """Send bot startup notification"""
         message = f"""
-🚀 **SENSEX TRADING BOT STARTED**
+🚀 SENSEX TRADING BOT STARTED
 
-⏰ **Time:** {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}
+⏰ Time: {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}
 
-📊 **Configuration:**
+📊 Configuration:
 ✅ Symbol: SENSEX Index (BSE)
 ✅ Scan Interval: Every 5 minutes
 ✅ Market Hours: 9:20 AM - 3:30 PM
 ✅ Expiry: {ExpiryCalculator.get_weekly_expiry()} - Every Tuesday ({ExpiryCalculator.days_to_expiry()} days left)
 
-🧠 **Analysis Framework:**
+🧠 Analysis Framework:
 ✅ Multi-Timeframe (1H + 15M + 5M)
 ✅ OI Comparison (15m + 30m lookback)
 ✅ Price Action + OI Fusion
 ✅ Support/Resistance with OI clusters
 ✅ Pattern Detection + OI confirmation
 
-💾 **Storage:**
+💾 Storage:
 ✅ Redis: OI snapshots (3-day retention)
 ✅ Candle data (auto-delete at 3:15 PM)
 
-🎯 **Alert Criteria:**
+🎯 Alert Criteria:
 ✅ Signal Type: CE_BUY / PE_BUY / NO_TRADE
 ✅ Minimum Confidence: 75%
 ✅ Alignment Score: 7+/10
 
-🔄 **Status:** Active & Running
+🔄 Status: Active & Running
 """
         await self.telegram_bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=message,
-            parse_mode='Markdown'
+            text=message
         )
         logger.info("✅ Startup message sent")
     
@@ -990,54 +989,60 @@ class SensexBot:
                     photo=photo
                 )
             
-            # Send signal details
+            # Send signal details (without Markdown to avoid parsing errors)
             signal_emoji = "🟢" if signal.signal_type == "CE_BUY" else "🔴"
             
+            # Escape special characters and limit text length
+            reasoning = signal.reasoning[:200].replace('_', ' ').replace('*', ' ').replace('[', '(').replace(']', ')')
+            price_analysis = signal.price_analysis[:250].replace('_', ' ').replace('*', ' ').replace('[', '(').replace(']', ')')
+            oi_analysis = signal.oi_analysis[:250].replace('_', ' ').replace('*', ' ').replace('[', '(').replace(']', ')')
+            pattern = signal.pattern_detected.replace('_', ' ').replace('*', ' ')
+            
             message = f"""
-{signal_emoji} **SENSEX {signal.signal_type} SIGNAL**
+{signal_emoji} SENSEX {signal.signal_type} SIGNAL
 
-🎯 **Confidence:** {signal.confidence}%
-📊 **Alignment:** {signal.timeframe_alignment} ({signal.alignment_score}/10)
+🎯 Confidence: {signal.confidence}%
+📊 Alignment: {signal.timeframe_alignment} ({signal.alignment_score}/10)
 
-💡 **REASONING:**
-{signal.reasoning}
+💡 REASONING:
+{reasoning}...
 
-📈 **PRICE ANALYSIS:**
-{signal.price_analysis[:300]}...
+📈 PRICE ANALYSIS:
+{price_analysis}...
 
-📊 **OI ANALYSIS:**
-{signal.oi_analysis[:300]}...
+📊 OI ANALYSIS:
+{oi_analysis}...
 
-🎨 **PATTERN:** {signal.pattern_detected}
+🎨 PATTERN: {pattern}
 
-💰 **TRADE SETUP:**
+💰 TRADE SETUP:
 Entry: ₹{signal.entry_price:.2f}
 Stop Loss: ₹{signal.stop_loss:.2f}
 Target 1: ₹{signal.target_1:.2f}
 Target 2: ₹{signal.target_2:.2f}
 Risk:Reward → {signal.risk_reward}
 
-📍 **Recommended Strike:** {signal.recommended_strike}
+📍 Recommended Strike: {signal.recommended_strike}
 
-📊 **Support Levels:** {', '.join([f'₹{s:.1f}' for s in signal.support_levels])}
-📊 **Resistance Levels:** {', '.join([f'₹{r:.1f}' for r in signal.resistance_levels])}
+📊 Support: {', '.join([f'₹{s:.1f}' for s in signal.support_levels])}
+📊 Resistance: {', '.join([f'₹{r:.1f}' for r in signal.resistance_levels])}
 
-⚠️ **Risk Factors:**
-{chr(10).join(['• ' + rf for rf in signal.risk_factors[:3]])}
+⚠️ RISK FACTORS:
+{chr(10).join(['• ' + rf.replace('_', ' ').replace('*', ' ') for rf in signal.risk_factors[:3]])}
 
 🕐 {datetime.now(IST).strftime('%d-%b %H:%M:%S')}
 """
             
             await self.telegram_bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=message,
-                parse_mode='Markdown'
+                text=message
             )
             
             logger.info(f"  ✅ Alert sent: {signal.signal_type}")
             
         except Exception as e:
             logger.error(f"  ❌ Telegram error: {e}")
+            traceback.print_exc()
     
     async def run_analysis(self):
         """Run complete analysis cycle"""
