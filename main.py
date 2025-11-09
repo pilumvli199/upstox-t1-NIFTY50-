@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-SENSEX HYBRID TRADING BOT
+NIFTY50 HYBRID TRADING BOT
 =================================================
 Multi-Timeframe Price Action + OI Intelligence
 Scan Interval: Every 5 minutes
-Target: SENSEX Index Only
+Target: NIFTY50 Index Only
 """
 
 import os
@@ -35,7 +35,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('sensex_bot.log')
+        logging.FileHandler('nifty50_bot.log')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -50,10 +50,10 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', 'your_chat_id')
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=5)
 
-# SENSEX Symbol Configuration
-SENSEX_SYMBOL = "BSE_INDEX|SENSEX"
-SENSEX_NAME = "SENSEX"
-SENSEX_DISPLAY = "SENSEX"
+# NIFTY50 Symbol Configuration
+NIFTY_SYMBOL = "NSE_INDEX|Nifty 50"
+NIFTY_NAME = "NIFTY"
+NIFTY_DISPLAY = "NIFTY50"
 
 # ==================== DATA CLASSES ====================
 @dataclass
@@ -107,7 +107,7 @@ class TradeSignal:
 class ExpiryCalculator:
     @staticmethod
     def get_weekly_expiry() -> str:
-        """Get SENSEX weekly expiry (Every Tuesday)"""
+        """Get NIFTY50 weekly expiry (Every Tuesday since Sept 1, 2025)"""
         today = datetime.now(IST).date()
         current_time = datetime.now(IST).time()
         
@@ -142,7 +142,7 @@ class RedisOIManager:
     @staticmethod
     def save_oi_snapshot(snapshot: OISnapshot):
         """Save complete OI snapshot to Redis"""
-        key = f"oi:sensex:{snapshot.timestamp.strftime('%Y-%m-%d_%H:%M')}"
+        key = f"oi:nifty50:{snapshot.timestamp.strftime('%Y-%m-%d_%H:%M')}"
         
         data = {
             "timestamp": snapshot.timestamp.isoformat(),
@@ -182,7 +182,7 @@ class RedisOIManager:
             microsecond=0
         )
         
-        key = f"oi:sensex:{target_time.strftime('%Y-%m-%d_%H:%M')}"
+        key = f"oi:nifty50:{target_time.strftime('%Y-%m-%d_%H:%M')}"
         data = redis_client.get(key)
         
         if data:
@@ -214,7 +214,7 @@ class RedisOIManager:
     @staticmethod
     def save_candle_data(timeframe: str, df: pd.DataFrame):
         """Save candle data to Redis (deleted daily at 3:15 PM)"""
-        key = f"candles:sensex:{timeframe}"
+        key = f"candles:nifty50:{timeframe}"
         
         # Convert to JSON
         df_copy = df.copy()
@@ -236,7 +236,7 @@ class RedisOIManager:
     @staticmethod
     def get_candle_data(timeframe: str) -> Optional[pd.DataFrame]:
         """Retrieve candle data from Redis"""
-        key = f"candles:sensex:{timeframe}"
+        key = f"candles:nifty50:{timeframe}"
         data = redis_client.get(key)
         
         if data:
@@ -263,7 +263,7 @@ class UpstoxDataFetcher:
             to_date = datetime.now(IST)
             from_date = to_date - timedelta(days=days)
             
-            url = f"https://api.upstox.com/v2/historical-candle/{SENSEX_SYMBOL}/{interval}/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
+            url = f"https://api.upstox.com/v2/historical-candle/{NIFTY_SYMBOL}/{interval}/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
             response = requests.get(url, headers=self.headers, timeout=30)
             
             if response.status_code == 200:
@@ -286,15 +286,15 @@ class UpstoxDataFetcher:
             return pd.DataFrame()
     
     def get_ltp(self) -> float:
-        """Get Last Traded Price for SENSEX"""
+        """Get Last Traded Price for NIFTY50"""
         try:
-            url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={SENSEX_SYMBOL}"
+            url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={NIFTY_SYMBOL}"
             response = requests.get(url, headers=self.headers, timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
-                if 'data' in data and SENSEX_SYMBOL in data['data']:
-                    ltp = float(data['data'][SENSEX_SYMBOL]['last_price'])
+                if 'data' in data and NIFTY_SYMBOL in data['data']:
+                    ltp = float(data['data'][NIFTY_SYMBOL]['last_price'])
                     logger.info(f"  💹 LTP: ₹{ltp:.2f}")
                     return ltp
             
@@ -308,7 +308,7 @@ class UpstoxDataFetcher:
     def get_option_chain(self, expiry: str) -> List[StrikeData]:
         """Fetch option chain data"""
         try:
-            url = f"https://api.upstox.com/v2/option/chain?instrument_key={SENSEX_SYMBOL}&expiry_date={expiry}"
+            url = f"https://api.upstox.com/v2/option/chain?instrument_key={NIFTY_SYMBOL}&expiry_date={expiry}"
             response = requests.get(url, headers=self.headers, timeout=30)
             
             if response.status_code == 200:
@@ -434,10 +434,10 @@ class OIAnalyzer:
     @staticmethod
     def get_atm_strikes(strikes: List[StrikeData], spot_price: float, count: int = 21) -> List[StrikeData]:
         """Get ATM strikes (±10 strikes from ATM)"""
-        atm_strike = round(spot_price / 100) * 100
+        atm_strike = round(spot_price / 50) * 50
         
         # Get strikes in range
-        strike_range = range(atm_strike - 1000, atm_strike + 1100, 100)
+        strike_range = range(atm_strike - 500, atm_strike + 550, 50)
         relevant = [s for s in strikes if s.strike in strike_range]
         
         # Sort by strike
@@ -587,7 +587,7 @@ class AIAnalyzer:
             prompt = f"""You are an elite institutional trader specializing in Price Action and Options Intelligence.
 Analyze this setup by COMBINING price action with OI data:
 
-SYMBOL: SENSEX
+SYMBOL: NIFTY50
 CURRENT PRICE: ₹{current_price:.2f}
 TIMESTAMP: {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}
 
@@ -911,7 +911,7 @@ Reason: {signal.reasoning[:100]}..."""
         )
         
         # Title
-        title = f"SENSEX | 15-Min | {signal.signal_type} | {signal.timeframe_alignment} Alignment"
+        title = f"NIFTY50 | 15-Min | {signal.signal_type} | {signal.timeframe_alignment} Alignment"
         ax1.set_title(title, color=TEXT, fontsize=13, fontweight='bold', pad=15)
         
         ax1.grid(True, color=GRID, alpha=0.3)
@@ -933,7 +933,7 @@ Reason: {signal.reasoning[:100]}..."""
         logger.info(f"  📊 Chart saved: {save_path}")
 
 # ==================== MAIN BOT ====================
-class SensexBot:
+class Nifty50Bot:
     """Main bot orchestrator"""
     
     def __init__(self):
@@ -945,12 +945,12 @@ class SensexBot:
     async def send_startup_message(self):
         """Send bot startup notification"""
         message = f"""
-🚀 SENSEX TRADING BOT STARTED
+🚀 NIFTY50 TRADING BOT STARTED
 
 ⏰ Time: {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}
 
 📊 Configuration:
-✅ Symbol: SENSEX Index (BSE)
+✅ Symbol: NIFTY50 Index (NSE)
 ✅ Scan Interval: Every 5 minutes
 ✅ Market Hours: 9:20 AM - 3:30 PM
 ✅ Expiry: {ExpiryCalculator.get_weekly_expiry()} - Every Tuesday ({ExpiryCalculator.days_to_expiry()} days left)
@@ -999,7 +999,7 @@ class SensexBot:
             pattern = signal.pattern_detected.replace('_', ' ').replace('*', ' ')
             
             message = f"""
-{signal_emoji} SENSEX {signal.signal_type} SIGNAL
+{signal_emoji} NIFTY50 {signal.signal_type} SIGNAL
 
 🎯 Confidence: {signal.confidence}%
 📊 Alignment: {signal.timeframe_alignment} ({signal.alignment_score}/10)
@@ -1163,7 +1163,7 @@ Risk:Reward → {signal.risk_reward}
             # Step 10: Generate chart and send alert
             logger.info(f"  🚨 ALERT! {signal.signal_type} | Conf: {signal.confidence}% | Score: {signal.alignment_score}/10")
             
-            chart_path = f"/tmp/sensex_chart_{datetime.now(IST).strftime('%H%M')}.png"
+            chart_path = f"/tmp/nifty50_chart_{datetime.now(IST).strftime('%H%M')}.png"
             ChartGenerator.create_chart(df_15m, signal, spot_price, chart_path)
             
             await self.send_telegram_alert(signal, chart_path)
@@ -1176,7 +1176,7 @@ Risk:Reward → {signal.risk_reward}
     async def run_scanner(self):
         """Main scanner loop"""
         logger.info("\n" + "="*80)
-        logger.info("🚀 SENSEX TRADING BOT")
+        logger.info("🚀 NIFTY50 TRADING BOT")
         logger.info("="*80)
         
         await self.send_startup_message()
@@ -1223,5 +1223,5 @@ Risk:Reward → {signal.risk_reward}
 
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
-    bot = SensexBot()
+    bot = Nifty50Bot()
     asyncio.run(bot.run_scanner())
