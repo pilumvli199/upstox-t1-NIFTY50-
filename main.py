@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """
-NIFTY50 HYBRID TRADING BOT
+NIFTY50 HYBRID TRADING BOT - FIXED VERSION
 =================================================
 Multi-Timeframe Price Action + OI Intelligence
 Scan Interval: Every 5 minutes
 Target: NIFTY50 Index Only
+
+🔧 FIXES:
+✅ Proper expiry date format (YYYY-MM-DD)
+✅ URL encoding for instrument keys
+✅ API expiry validation
+✅ Fallback mechanisms
 """
 
 import os
 import asyncio
 import requests
+import urllib.parse
 from datetime import datetime, timedelta, time
 import pytz
 import time as time_sleep
@@ -85,7 +92,7 @@ class OISnapshot:
 @dataclass
 class TradeSignal:
     """Trading signal with full details"""
-    signal_type: str  # "CE_BUY", "PE_BUY", "NO_TRADE"
+    signal_type: str
     confidence: int
     entry_price: float
     stop_loss: float
@@ -103,16 +110,44 @@ class TradeSignal:
     pattern_detected: str
     timeframe_alignment: str
 
-# ==================== EXPIRY CALCULATOR ====================
+# ==================== EXPIRY CALCULATOR (FIXED) ====================
 class ExpiryCalculator:
     @staticmethod
-    def get_weekly_expiry() -> str:
-        """Get NIFTY50 weekly expiry (Every Tuesday since Sept 1, 2025)"""
+    def get_all_expiries_from_api(instrument_key: str, access_token: str) -> List[str]:
+        """Fetch all available expiries from Upstox API"""
+        try:
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {access_token}"
+            }
+            
+            # URL encode the instrument key
+            encoded_key = urllib.parse.quote(instrument_key, safe='')
+            url = f"https://api.upstox.com/v2/option/contract?instrument_key={encoded_key}"
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                contracts = response.json().get('data', [])
+                # Extract unique expiry dates
+                expiries = sorted(list(set(c['expiry'] for c in contracts if 'expiry' in c)))
+                logger.info(f"  📅 Found {len(expiries)} expiries from API")
+                return expiries
+            else:
+                logger.warning(f"  ⚠️ Contract API returned {response.status_code}")
+                return []
+        except Exception as e:
+            logger.error(f"  ❌ Expiry API error: {e}")
+            return []
+    
+    @staticmethod
+    def get_next_tuesday() -> str:
+        """Calculate next Tuesday expiry (YYYY-MM-DD format)"""
         today = datetime.now(IST).date()
         current_time = datetime.now(IST).time()
         
-        # Find next Tuesday (weekday 1)
-        days_ahead = 1 - today.weekday()  # 1 = Tuesday
+        # Find next Tuesday (weekday = 1)
+        days_ahead = 1 - today.weekday()
         
         if days_ahead <= 0:  # Today is Tuesday or past Tuesday
             if today.weekday() == 1 and current_time < time(15, 30):
@@ -126,14 +161,55 @@ class ExpiryCalculator:
             # Upcoming Tuesday this week
             expiry = today + timedelta(days=days_ahead)
         
-        return expiry.strftime('%d%b%y').upper()
+        return expiry.strftime('%Y-%m-%d')
     
     @staticmethod
-    def days_to_expiry() -> int:
+    def get_weekly_expiry(access_token: str) -> str:
+        """Get NIFTY50 weekly expiry with API validation"""
+        # Get all available expiries
+        expiries = ExpiryCalculator.get_all_expiries_from_api(NIFTY_SYMBOL, access_token)
+        
+        if expiries:
+            # Filter future expiries
+            today = datetime.now(IST).date()
+            now_time = datetime.now(IST).time()
+            
+            future_expiries = []
+            for exp_str in expiries:
+                try:
+                    exp_date = datetime.strptime(exp_str, '%Y-%m-%d').date()
+                    if exp_date > today or (exp_date == today and now_time < time(15, 30)):
+                        future_expiries.append(exp_str)
+                except:
+                    continue
+            
+            if future_expiries:
+                nearest_expiry = min(future_expiries)
+                logger.info(f"  ✅ Using API expiry: {nearest_expiry}")
+                return nearest_expiry
+        
+        # Fallback: Calculate next Tuesday
+        calculated_expiry = ExpiryCalculator.get_next_tuesday()
+        logger.info(f"  ⚠️ Using calculated expiry: {calculated_expiry}")
+        return calculated_expiry
+    
+    @staticmethod
+    def days_to_expiry(expiry_str: str) -> int:
         """Calculate days remaining to expiry"""
-        expiry_str = ExpiryCalculator.get_weekly_expiry()
-        expiry_date = datetime.strptime(expiry_str, '%d%b%y').date()
-        return (expiry_date - datetime.now(IST).date()).days
+        try:
+            expiry_date = datetime.strptime(expiry_str, '%Y-%m-%d').date()
+            return (expiry_date - datetime.now(IST).date()).days
+        except:
+            return 0
+    
+    @staticmethod
+    def format_for_display(expiry_str: str) -> str:
+        """Convert YYYY-MM-DD to DDMmmYY format for display"""
+        try:
+            dt = datetime.strptime(expiry_str, '%Y-%m-%d')
+            return dt.strftime('%d%b%y').upper()
+        except:
+            return expiry_str
 
 # ==================== REDIS OI MANAGER ====================
 class RedisOIManager:
@@ -246,9 +322,9 @@ class RedisOIManager:
         
         return None
 
-# ==================== UPSTOX DATA FETCHER ====================
+# ==================== UPSTOX DATA FETCHER (FIXED) ====================
 class UpstoxDataFetcher:
-    """Fetches data from Upstox API"""
+    """Fetches data from Upstox API with proper encoding"""
     
     def __init__(self, access_token: str):
         self.access_token = access_token
@@ -263,7 +339,10 @@ class UpstoxDataFetcher:
             to_date = datetime.now(IST)
             from_date = to_date - timedelta(days=days)
             
-            url = f"https://api.upstox.com/v2/historical-candle/{NIFTY_SYMBOL}/{interval}/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
+            # URL encode instrument key
+            encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
+            
+            url = f"https://api.upstox.com/v2/historical-candle/{encoded_symbol}/{interval}/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
             response = requests.get(url, headers=self.headers, timeout=30)
             
             if response.status_code == 200:
@@ -288,7 +367,10 @@ class UpstoxDataFetcher:
     def get_ltp(self) -> float:
         """Get Last Traded Price for NIFTY50"""
         try:
-            url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={NIFTY_SYMBOL}"
+            # URL encode instrument key
+            encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
+            
+            url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded_symbol}"
             response = requests.get(url, headers=self.headers, timeout=10)
             
             if response.status_code == 200:
@@ -306,15 +388,26 @@ class UpstoxDataFetcher:
             return 0.0
     
     def get_option_chain(self, expiry: str) -> List[StrikeData]:
-        """Fetch option chain data"""
+        """Fetch option chain data with proper encoding"""
         try:
-            url = f"https://api.upstox.com/v2/option/chain?instrument_key={NIFTY_SYMBOL}&expiry_date={expiry}"
+            # URL encode instrument key
+            encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
+            
+            # Expiry should already be in YYYY-MM-DD format
+            url = f"https://api.upstox.com/v2/option/chain?instrument_key={encoded_symbol}&expiry_date={expiry}"
+            
+            logger.info(f"  🔗 Option Chain URL: {url}")
+            
             response = requests.get(url, headers=self.headers, timeout=30)
+            
+            logger.info(f"  📡 Response Status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
+                
                 if 'data' not in data:
                     logger.warning(f"  ⚠️ No 'data' in option chain response")
+                    logger.info(f"  Response: {json.dumps(data, indent=2)[:500]}")
                     return []
                 
                 strikes = []
@@ -335,16 +428,24 @@ class UpstoxDataFetcher:
                             pe_price=float(put_data.get('ltp', 0))
                         ))
                     except Exception as item_error:
+                        logger.warning(f"  ⚠️ Strike parsing error: {item_error}")
                         continue
                 
                 logger.info(f"  ✅ Fetched {len(strikes)} strikes")
                 return strikes
-            
-            logger.warning(f"  ⚠️ Option chain API returned {response.status_code}")
-            return []
+            else:
+                # Log error details
+                logger.error(f"  ❌ Option chain API error {response.status_code}")
+                try:
+                    error_data = response.json()
+                    logger.error(f"  Error details: {json.dumps(error_data, indent=2)}")
+                except:
+                    logger.error(f"  Response text: {response.text[:500]}")
+                return []
             
         except Exception as e:
             logger.error(f"  ❌ Option chain error: {e}")
+            traceback.print_exc()
             return []
 
 # ==================== MULTI-TIMEFRAME PROCESSOR ====================
@@ -479,23 +580,6 @@ class OIAnalyzer:
             total_ce_oi=total_ce,
             total_pe_oi=total_pe
         )
-    
-    @staticmethod
-    def compare_oi_snapshots(current: OISnapshot, past: OISnapshot) -> List[StrikeData]:
-        """Compare current OI with past and add change data"""
-        past_map = {s.strike: s for s in past.strikes}
-        
-        enriched_strikes = []
-        for current_strike in current.strikes:
-            past_strike = past_map.get(current_strike.strike)
-            
-            if past_strike:
-                current_strike.ce_oi_change_15m = current_strike.ce_oi - past_strike.ce_oi
-                current_strike.pe_oi_change_15m = current_strike.pe_oi - past_strike.pe_oi
-            
-            enriched_strikes.append(current_strike)
-        
-        return enriched_strikes
 
 # ==================== AI ANALYZER ====================
 class AIAnalyzer:
@@ -505,11 +589,9 @@ class AIAnalyzer:
     def extract_json(content: str) -> Optional[Dict]:
         """Extract JSON from AI response"""
         try:
-            # Remove markdown code blocks
             content = re.sub(r'```json\s*|\s*```', '', content)
             return json.loads(content)
         except:
-            # Try to find JSON object
             match = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', content, re.DOTALL)
             if match:
                 try:
@@ -531,30 +613,26 @@ class AIAnalyzer:
         """Send comprehensive analysis request to DeepSeek"""
         
         try:
-            # Prepare candle data (last 200 for 5m, 175 for 15m, 50 for 1h)
             df_5m_tail = df_5m.tail(200).copy()
             df_15m_tail = df_15m.tail(175).copy()
             df_1h_tail = df_1h.tail(50).copy()
             
-            # Format timestamps
             df_5m_tail['timestamp'] = df_5m_tail['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
             df_15m_tail['timestamp'] = df_15m_tail['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
             df_1h_tail['timestamp'] = df_1h_tail['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
             
-            # Convert to JSON
             candles_5m = df_5m_tail[['timestamp', 'open', 'high', 'low', 'close', 'volume']].to_json(orient='records')
             candles_15m = df_15m_tail[['timestamp', 'open', 'high', 'low', 'close', 'volume']].to_json(orient='records')
             candles_1h = df_1h_tail[['timestamp', 'open', 'high', 'low', 'close', 'volume']].to_json(orient='records')
             
-            # Format OI data
             current_oi_text = "\n".join([
                 f"{s.strike}: CE: {s.ce_oi:,} | PE: {s.pe_oi:,}"
                 for s in current_oi.strikes
             ])
             
-            oi_15m_text = "NOT AVAILABLE (First scan)"
-            oi_30m_text = "NOT AVAILABLE (First scan)"
-            oi_velocity_text = "NOT AVAILABLE (First scan)"
+            oi_15m_text = "NOT AVAILABLE"
+            oi_30m_text = "NOT AVAILABLE"
+            oi_velocity_text = "NOT AVAILABLE"
             pcr_comparison = f"Now: {current_oi.pcr:.2f}"
             
             if oi_15m_ago:
@@ -564,7 +642,6 @@ class AIAnalyzer:
                 ])
                 pcr_comparison += f" | 15min ago: {oi_15m_ago.pcr:.2f}"
                 
-                # Calculate velocity
                 ce_change_15m = current_oi.total_ce_oi - oi_15m_ago.total_ce_oi
                 pe_change_15m = current_oi.total_pe_oi - oi_15m_ago.total_pe_oi
                 oi_velocity_text = f"Last 15 min: CE {ce_change_15m:+,} | PE {pe_change_15m:+,}"
@@ -580,107 +657,31 @@ class AIAnalyzer:
                 pe_change_30m = current_oi.total_pe_oi - oi_30m_ago.total_pe_oi
                 oi_velocity_text += f"\nLast 30 min: CE {ce_change_30m:+,} | PE {pe_change_30m:+,}"
             
-            expiry = ExpiryCalculator.get_weekly_expiry()
-            days_remaining = ExpiryCalculator.days_to_expiry()
-            
-            # Build comprehensive prompt
             prompt = f"""You are an elite institutional trader specializing in Price Action and Options Intelligence.
-Analyze this setup by COMBINING price action with OI data:
 
-SYMBOL: NIFTY50
-CURRENT PRICE: ₹{current_price:.2f}
-TIMESTAMP: {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}
+NIFTY50 ANALYSIS:
+Current Price: ₹{current_price:.2f}
+Timestamp: {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}
 
-═══════════════════════════════════════
 MULTI-TIMEFRAME PRICE ACTION:
+5-MIN: {candles_5m}
+15-MIN: {candles_15m}
+1-HOUR: {candles_1h}
 
-5-MIN TF (Last 200 candles):
-{candles_5m}
+OPTION CHAIN DATA:
+CURRENT OI: {current_oi_text}
+15 MIN AGO: {oi_15m_text}
+30 MIN AGO: {oi_30m_text}
 
-15-MIN TF (Last 175 candles):
-{candles_15m}
-
-1-HOUR TF (Last 50 candles):
-{candles_1h}
-
-═══════════════════════════════════════
-OPTION CHAIN WITH TIME-BASED COMPARISON:
-
-Expiry: {expiry} | Days Left: {days_remaining}
-
-CURRENT OI:
-{current_oi_text}
-
-15 MINUTES AGO:
-{oi_15m_text}
-
-30 MINUTES AGO:
-{oi_30m_text}
-
-OI VELOCITY:
-{oi_velocity_text}
-
+OI VELOCITY: {oi_velocity_text}
 PCR: {pcr_comparison}
 Max Pain: {current_oi.max_pain}
-SUPPORT: {', '.join(map(str, current_oi.support_strikes))}
-RESISTANCE: {', '.join(map(str, current_oi.resistance_strikes))}
+Support: {', '.join(map(str, current_oi.support_strikes))}
+Resistance: {', '.join(map(str, current_oi.resistance_strikes))}
 
-═══════════════════════════════════════
-ANALYZE BY COMBINING BOTH:
+Analyze price action + OI fusion and provide trading signal.
 
-1. PRICE ACTION + OI CORRELATION:
-   - When price moves up, OI kay karat? (buildup/unwinding)
-   - When price moves down, OI kay karat?
-   - Confirmation or divergence?
-
-2. MULTI-TIMEFRAME PRICE + OI SYNC:
-   - All 3 timeframes aligned ka?
-   - Price bullish pan OI bearish? (or vice versa)
-   - Konti timeframe dominant?
-
-3. OI MOMENTUM + PRICE MOMENTUM:
-   - OI velocity fast ahe ka? (15min vs 30min)
-   - Price velocity match karat ka?
-   - Acceleration or deceleration?
-
-4. SMART MONEY FOOTPRINTS:
-   - Price action + OI changes combine karun institutional activity detect kara
-   - Call writing with price rise = resistance
-   - Put writing with price fall = support
-   - OI spikes at specific strikes = walls/magnets
-
-5. SUPPORT/RESISTANCE + OI CLUSTERS:
-   - Price levels + OI concentration kadhe match?
-   - Strong OI at support/resistance = validation
-
-6. PATTERN + OI CONFIRMATION:
-   - Price pattern (breakout/reversal) + OI changes confirm karat?
-   - Fakeout risk kay ahe? (price move without OI support)
-
-7. SCENARIOS WITH PROBABILITIES:
-   - Price + OI combine karun most likely outcomes
-   - Each scenario chi win probability
-   - Trigger points clearly define
-
-8. TRADE SETUPS (PRICE + OI BASED):
-   - Entry: Price level + OI confirmation kadhe?
-   - Stop Loss: Price + OI invalidation point
-   - Target: OI resistance/support zones
-   - Position size: Risk based on alignment strength
-
-9. TIMING:
-   - Best entry timing (timeframe + OI alignment)
-   - Avoid zones (conflicting signals)
-
-10. RISK RATING:
-    - Alignment strength (1-10)
-    - Confidence level
-    - Red flags (divergences)
-
-Focus on FUSION - don't analyze price and OI separately. Show how they work TOGETHER to reveal market truth.
-Be precise, institutional-grade, and actionable.
-
-OUTPUT JSON FORMAT:
+OUTPUT JSON:
 {{
   "signal_type": "CE_BUY/PE_BUY/NO_TRADE",
   "confidence": 85,
@@ -690,19 +691,17 @@ OUTPUT JSON FORMAT:
   "target_2": 0.0,
   "risk_reward": "1:2.5",
   "recommended_strike": {round(current_price/50)*50},
-  "reasoning": "Brief overall reasoning combining price + OI",
-  "price_analysis": "Pure price action analysis across timeframes",
-  "oi_analysis": "Pure OI flow analysis with velocity",
+  "reasoning": "Brief reasoning",
+  "price_analysis": "Price action analysis",
+  "oi_analysis": "OI flow analysis",
   "alignment_score": 8,
   "risk_factors": ["Risk 1", "Risk 2"],
   "support_levels": [0.0, 0.0],
   "resistance_levels": [0.0, 0.0],
-  "pattern_detected": "Bullish Flag / Bearish Head & Shoulders / None",
+  "pattern_detected": "Pattern name or None",
   "timeframe_alignment": "STRONG/MODERATE/WEAK"
-}}
-"""
+}}"""
             
-            # Call DeepSeek API
             response = requests.post(
                 "https://api.deepseek.com/v1/chat/completions",
                 json={
@@ -760,7 +759,6 @@ class ChartGenerator:
     ):
         """Generate professional chart with signal visualization"""
         
-        # Chart colors
         BG = '#131722'
         GRID = '#1e222d'
         TEXT = '#d1d4dc'
@@ -776,15 +774,12 @@ class ChartGenerator:
             facecolor=BG
         )
         
-        # Main price chart
         ax1.set_facecolor(BG)
         df_plot = df_15m.tail(150).reset_index(drop=True)
         
-        # Draw candlesticks
         for idx, row in df_plot.iterrows():
             color = GREEN if row['close'] > row['open'] else RED
             
-            # Body
             ax1.add_patch(Rectangle(
                 (idx, min(row['open'], row['close'])),
                 0.6,
@@ -794,7 +789,6 @@ class ChartGenerator:
                 alpha=0.8
             ))
             
-            # Wick
             ax1.plot(
                 [idx+0.3, idx+0.3],
                 [row['low'], row['high']],
@@ -803,7 +797,6 @@ class ChartGenerator:
                 alpha=0.6
             )
         
-        # Draw support levels
         for support in signal.support_levels:
             ax1.axhline(support, color=GREEN, linestyle='--', linewidth=1.5, alpha=0.7)
             ax1.text(
@@ -816,7 +809,6 @@ class ChartGenerator:
                 bbox=dict(boxstyle='round', facecolor=BG, alpha=0.7)
             )
         
-        # Draw resistance levels
         for resistance in signal.resistance_levels:
             ax1.axhline(resistance, color=RED, linestyle='--', linewidth=1.5, alpha=0.7)
             ax1.text(
@@ -829,7 +821,6 @@ class ChartGenerator:
                 bbox=dict(boxstyle='round', facecolor=BG, alpha=0.7)
             )
         
-        # Entry point
         ax1.scatter(
             [len(df_plot)-1],
             [signal.entry_price],
@@ -841,12 +832,10 @@ class ChartGenerator:
             linewidths=2.5
         )
         
-        # Stop loss and targets
         ax1.axhline(signal.stop_loss, color=RED, linewidth=2.5, linestyle=':')
         ax1.axhline(signal.target_1, color=GREEN, linewidth=2, linestyle=':')
         ax1.axhline(signal.target_2, color=GREEN, linewidth=2, linestyle=':')
         
-        # Entry label
         ax1.text(
             len(df_plot)*0.97, signal.entry_price,
             f'ENTRY: ₹{signal.entry_price:.2f}  ',
@@ -858,7 +847,6 @@ class ChartGenerator:
             bbox=dict(boxstyle='round', facecolor=BG, edgecolor=YELLOW, linewidth=2)
         )
         
-        # Pattern label
         if signal.pattern_detected and signal.pattern_detected != "None":
             ax1.text(
                 len(df_plot)*0.5, df_plot['high'].max() * 0.995,
@@ -870,7 +858,6 @@ class ChartGenerator:
                 bbox=dict(boxstyle='round', facecolor=BG, edgecolor=YELLOW, alpha=0.9)
             )
         
-        # Current price
         ax1.text(
             len(df_plot)-1, spot_price,
             f'  CMP: ₹{spot_price:.1f}',
@@ -881,7 +868,6 @@ class ChartGenerator:
             va='center'
         )
         
-        # Info box
         signal_emoji = "🟢" if signal.signal_type == "CE_BUY" else "🔴" if signal.signal_type == "PE_BUY" else "⚪"
         
         info_text = f"""{signal_emoji} {signal.signal_type} | Confidence: {signal.confidence}%
@@ -894,7 +880,6 @@ T2: ₹{signal.target_2:.1f}
 RR: {signal.risk_reward}
 
 Strike: {signal.recommended_strike}
-
 Pattern: {signal.pattern_detected}
 
 Reason: {signal.reasoning[:100]}..."""
@@ -910,7 +895,6 @@ Reason: {signal.reasoning[:100]}..."""
             family='monospace'
         )
         
-        # Title
         title = f"NIFTY50 | 15-Min | {signal.signal_type} | {signal.timeframe_alignment} Alignment"
         ax1.set_title(title, color=TEXT, fontsize=13, fontweight='bold', pad=15)
         
@@ -918,7 +902,6 @@ Reason: {signal.reasoning[:100]}..."""
         ax1.tick_params(colors=TEXT)
         ax1.set_ylabel('Price (₹)', color=TEXT, fontsize=11)
         
-        # Volume chart
         ax2.set_facecolor(BG)
         colors = [GREEN if df_plot.iloc[i]['close'] > df_plot.iloc[i]['open'] else RED for i in range(len(df_plot))]
         ax2.bar(range(len(df_plot)), df_plot['volume'], color=colors, alpha=0.6, width=0.8)
@@ -944,8 +927,12 @@ class Nifty50Bot:
     
     async def send_startup_message(self):
         """Send bot startup notification"""
+        expiry = ExpiryCalculator.get_weekly_expiry(UPSTOX_ACCESS_TOKEN)
+        expiry_display = ExpiryCalculator.format_for_display(expiry)
+        days_left = ExpiryCalculator.days_to_expiry(expiry)
+        
         message = f"""
-🚀 NIFTY50 TRADING BOT STARTED
+🚀 NIFTY50 TRADING BOT STARTED (FIXED)
 
 ⏰ Time: {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}
 
@@ -953,7 +940,13 @@ class Nifty50Bot:
 ✅ Symbol: NIFTY50 Index (NSE)
 ✅ Scan Interval: Every 5 minutes
 ✅ Market Hours: 9:20 AM - 3:30 PM
-✅ Expiry: {ExpiryCalculator.get_weekly_expiry()} - Every Tuesday ({ExpiryCalculator.days_to_expiry()} days left)
+✅ Expiry: {expiry_display} ({expiry}) - {days_left} days left
+
+🔧 FIXES APPLIED:
+✅ Proper expiry format (YYYY-MM-DD)
+✅ URL encoding for API calls
+✅ API expiry validation
+✅ Enhanced error logging
 
 🧠 Analysis Framework:
 ✅ Multi-Timeframe (1H + 15M + 5M)
@@ -962,12 +955,7 @@ class Nifty50Bot:
 ✅ Support/Resistance with OI clusters
 ✅ Pattern Detection + OI confirmation
 
-💾 Storage:
-✅ Redis: OI snapshots (3-day retention)
-✅ Candle data (auto-delete at 3:15 PM)
-
 🎯 Alert Criteria:
-✅ Signal Type: CE_BUY / PE_BUY / NO_TRADE
 ✅ Minimum Confidence: 75%
 ✅ Alignment Score: 7+/10
 
@@ -982,20 +970,17 @@ class Nifty50Bot:
     async def send_telegram_alert(self, signal: TradeSignal, chart_path: str):
         """Send trading signal to Telegram"""
         try:
-            # Send chart
             with open(chart_path, 'rb') as photo:
                 await self.telegram_bot.send_photo(
                     chat_id=TELEGRAM_CHAT_ID,
                     photo=photo
                 )
             
-            # Send signal details (without Markdown to avoid parsing errors)
             signal_emoji = "🟢" if signal.signal_type == "CE_BUY" else "🔴"
             
-            # Escape special characters and limit text length
-            reasoning = signal.reasoning[:200].replace('_', ' ').replace('*', ' ').replace('[', '(').replace(']', ')')
-            price_analysis = signal.price_analysis[:250].replace('_', ' ').replace('*', ' ').replace('[', '(').replace(']', ')')
-            oi_analysis = signal.oi_analysis[:250].replace('_', ' ').replace('*', ' ').replace('[', '(').replace(']', ')')
+            reasoning = signal.reasoning[:200].replace('_', ' ').replace('*', ' ')
+            price_analysis = signal.price_analysis[:250].replace('_', ' ').replace('*', ' ')
+            oi_analysis = signal.oi_analysis[:250].replace('_', ' ').replace('*', ' ')
             pattern = signal.pattern_detected.replace('_', ' ').replace('*', ' ')
             
             message = f"""
@@ -1052,7 +1037,6 @@ Risk:Reward → {signal.risk_reward}
             logger.info(f"🔍 SCAN #{self.scan_count} - {datetime.now(IST).strftime('%H:%M:%S')}")
             logger.info(f"{'='*70}")
             
-            # Step 1: Fetch or load historical data (1-minute candles)
             df_1m_cached = RedisOIManager.get_candle_data('1m')
             
             if df_1m_cached is None or len(df_1m_cached) == 0:
@@ -1066,15 +1050,12 @@ Risk:Reward → {signal.risk_reward}
                 logger.info(f"  ✅ Loaded {len(df_1m_cached)} 1-min candles from Redis")
                 df_1m = df_1m_cached
                 
-                # Fetch latest candle and append
                 logger.info("  📥 Fetching latest 1-min candle...")
                 df_latest = self.data_fetcher.get_historical_data('1minute', days=1)
                 if not df_latest.empty:
-                    # Append new candles
                     df_1m = pd.concat([df_1m, df_latest]).drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
                     RedisOIManager.save_candle_data('1m', df_1m)
             
-            # Step 2: Resample to higher timeframes
             logger.info("  🔄 Resampling to higher timeframes...")
             df_5m = MultiTimeframeProcessor.resample_to_timeframe(df_1m, '5T')
             df_15m = MultiTimeframeProcessor.resample_to_timeframe(df_1m, '15T')
@@ -1082,53 +1063,46 @@ Risk:Reward → {signal.risk_reward}
             
             logger.info(f"  📊 Candles: 5M({len(df_5m)}) | 15M({len(df_15m)}) | 1H({len(df_1h)})")
             
-            # Save resampled data
             RedisOIManager.save_candle_data('5m', df_5m)
             RedisOIManager.save_candle_data('15m', df_15m)
             RedisOIManager.save_candle_data('1h', df_1h)
             
-            # Step 3: Get timeframe biases
             bias_5m, conf_5m = MultiTimeframeProcessor.get_timeframe_bias(df_5m)
             bias_15m, conf_15m = MultiTimeframeProcessor.get_timeframe_bias(df_15m)
             bias_1h, conf_1h = MultiTimeframeProcessor.get_timeframe_bias(df_1h)
             
             logger.info(f"  📊 Bias: 1H {bias_1h}({conf_1h}%) | 15M {bias_15m}({conf_15m}%) | 5M {bias_5m}({conf_5m}%)")
             
-            # Step 4: Get current price
             spot_price = self.data_fetcher.get_ltp()
             if spot_price == 0:
                 spot_price = df_15m['close'].iloc[-1]
                 logger.info(f"  💹 Using last close: ₹{spot_price:.2f}")
             
-            # Step 5: Fetch option chain
-            expiry = ExpiryCalculator.get_weekly_expiry()
-            logger.info(f"  📅 Weekly Expiry (Tuesday): {expiry}")
+            expiry = ExpiryCalculator.get_weekly_expiry(UPSTOX_ACCESS_TOKEN)
+            expiry_display = ExpiryCalculator.format_for_display(expiry)
+            logger.info(f"  📅 Expiry: {expiry_display} ({expiry})")
             
             all_strikes = self.data_fetcher.get_option_chain(expiry)
             if not all_strikes:
                 logger.warning("  ⚠️ No option chain data available")
                 return
             
-            # Step 6: Create current OI snapshot
             current_oi = OIAnalyzer.create_oi_snapshot(all_strikes, spot_price)
             logger.info(f"  📊 PCR: {current_oi.pcr:.2f} | Max Pain: {current_oi.max_pain}")
             
-            # Save current OI
             RedisOIManager.save_oi_snapshot(current_oi)
             
-            # Step 7: Get past OI snapshots for comparison
             oi_15m_ago = RedisOIManager.get_oi_snapshot(15)
             oi_30m_ago = RedisOIManager.get_oi_snapshot(30)
             
             if oi_15m_ago:
                 logger.info(f"  ✅ Loaded OI from 15 min ago (PCR: {oi_15m_ago.pcr:.2f})")
             else:
-                logger.info(f"  ℹ️ No OI data from 15 min ago (first scans)")
+                logger.info(f"  ℹ️ No OI data from 15 min ago")
             
             if oi_30m_ago:
                 logger.info(f"  ✅ Loaded OI from 30 min ago (PCR: {oi_30m_ago.pcr:.2f})")
             
-            # Step 8: Send to AI for analysis
             logger.info("  🧠 Sending to DeepSeek AI...")
             signal = AIAnalyzer.analyze_with_deepseek(
                 df_5m=df_5m,
@@ -1144,7 +1118,6 @@ Risk:Reward → {signal.risk_reward}
                 logger.info("  ⏸️ No valid signal generated")
                 return
             
-            # Step 9: Check if alert should be sent
             if signal.signal_type == "NO_TRADE":
                 logger.info(f"  ⏸️ NO_TRADE signal (Confidence: {signal.confidence}%)")
                 return
@@ -1153,14 +1126,12 @@ Risk:Reward → {signal.risk_reward}
                 logger.info(f"  ⏸️ Below threshold (Conf: {signal.confidence}% | Score: {signal.alignment_score}/10)")
                 return
             
-            # Check cooldown (don't spam alerts)
             if self.last_signal_time:
                 time_since_last = (datetime.now(IST) - self.last_signal_time).total_seconds() / 60
-                if time_since_last < 30:  # 30 min cooldown
+                if time_since_last < 30:
                     logger.info(f"  ⏸️ Cooldown active ({time_since_last:.0f} min since last alert)")
                     return
             
-            # Step 10: Generate chart and send alert
             logger.info(f"  🚨 ALERT! {signal.signal_type} | Conf: {signal.confidence}% | Score: {signal.alignment_score}/10")
             
             chart_path = f"/tmp/nifty50_chart_{datetime.now(IST).strftime('%H%M')}.png"
@@ -1176,7 +1147,7 @@ Risk:Reward → {signal.risk_reward}
     async def run_scanner(self):
         """Main scanner loop"""
         logger.info("\n" + "="*80)
-        logger.info("🚀 NIFTY50 TRADING BOT")
+        logger.info("🚀 NIFTY50 TRADING BOT (FIXED VERSION)")
         logger.info("="*80)
         
         await self.send_startup_message()
@@ -1186,22 +1157,18 @@ Risk:Reward → {signal.risk_reward}
                 now = datetime.now(IST)
                 current_time = now.time()
                 
-                # Market hours: 9:20 AM to 3:30 PM
                 if current_time < time(9, 20) or current_time > time(15, 30):
                     logger.info(f"⏸️ Market closed. Waiting... (Current: {current_time.strftime('%H:%M')})")
-                    await asyncio.sleep(300)  # Check every 5 minutes
+                    await asyncio.sleep(300)
                     continue
                 
-                # Skip weekends
                 if now.weekday() >= 5:
                     logger.info(f"📅 Weekend. Pausing...")
                     await asyncio.sleep(3600)
                     continue
                 
-                # Run analysis
                 await self.run_analysis()
                 
-                # Wait for next 5-minute mark
                 current_minute = now.minute
                 next_scan_minute = ((current_minute // 5) + 1) * 5
                 if next_scan_minute >= 60:
