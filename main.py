@@ -747,9 +747,14 @@ class ChartGenerator:
         
         ax1.set_facecolor(BG)
         
-        # Use last 200 candles for chart display
+        # Use last 200 candles (historical + today) up to current scan time
+        # This matches the analysis timeframe (420 candles for analysis, 200 for display)
         df_plot = df_5m.tail(200).copy()
         df_plot = df_plot.reset_index(drop=True)
+        
+        first_candle_time = df_plot.iloc[0]['timestamp'].strftime('%d-%b %H:%M')
+        last_candle_time = df_plot.iloc[-1]['timestamp'].strftime('%d-%b %H:%M')
+        logger.info(f"  📊 Chart: {len(df_plot)} candles ({first_candle_time} to {last_candle_time})")
         
         # Extract time labels for x-axis (show every 10th candle)
         time_labels = []
