@@ -359,63 +359,107 @@ class UpstoxDataFetcher:
     def get_intraday_data(self) -> pd.DataFrame:
         """Fetch TODAY'S live 5-minute candles using Intraday API"""
         try:
-            # CRITICAL: Use proper encoding for NIFTY symbol
-            # Upstox expects: NSE_INDEX%7CNifty%2050
+            # CRITICAL: Intraday API URL format check
             encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
             
-            # Intraday API - Today's live data
+            # Intraday API - Today's live data ONLY
             url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_symbol}/5minute"
             
-            logger.info(f"  📥 Fetching intraday data...")
+            logger.info(f"  📥 Fetching TODAY's intraday data...")
             logger.info(f"  🔗 URL: {url}")
+            
+            # Check if market is open
+            now = datetime.now(IST)
+            if now.time() < MARKET_START_TIME:
+                logger.warning(f"  ⚠️ Market not started yet (opens at 9:15 AM)")
+                return pd.DataFrame()
+            
             response = requests.get(url, headers=self.headers, timeout=30)
             
             if response.status_code == 200:
                 data = response.json()
+                logger.info(f"  📊 Intraday Response Status: {data.get('status', 'unknown')}")
+                
                 if 'data' in data and 'candles' in data['data']:
-                    df = pd.DataFrame(
-                        data['data']['candles'],
-                        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
-                    )
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df = df.sort_values('timestamp').reset_index(drop=True)
-                    logger.info(f"  ✅ Fetched {len(df)} intraday candles (TODAY)")
-                    return df
+                    candles = data['data']['candles']
+                    if len(candles) > 0:
+                        df = pd.DataFrame(
+                            candles,
+                            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
+                        )
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        df = df.sort_values('timestamp').reset_index(drop=True)
+                        logger.info(f"  ✅ Fetched {len(df)} intraday candles (TODAY)")
+                        return df
+                    else:
+                        logger.warning(f"  ⚠️ Intraday API returned 0 candles (market may not be active)")
+                else:
+                    logger.warning(f"  ⚠️ Unexpected intraday response structure")
+                    logger.warning(f"  Response: {json.dumps(data, indent=2)[:500]}")
+            else:
+                logger.warning(f"  ⚠️ Intraday API returned {response.status_code}")
+                try:
+                    error_data = response.json()
+                    logger.warning(f"  Error: {json.dumps(error_data, indent=2)}")
+                except:
+                    logger.warning(f"  Response: {response.text[:300]}")
             
-            logger.warning(f"  ⚠️ Intraday API returned {response.status_code}")
             return pd.DataFrame()
             
         except Exception as e:
             logger.error(f"  ❌ Intraday data error: {e}")
             return pd.DataFrame()
     
-    def get_historical_data(self, days: int = 3) -> pd.DataFrame:
-        """Fetch HISTORICAL 5-minute data (past days, excluding today)"""
+    def get_historical_data(self, days: int = 5) -> pd.DataFrame:
+        """Fetch HISTORICAL 5-minute data (COMPLETED days only, NOT today)"""
         try:
-            # Fetch data from 3 days ago to yesterday
+            # CRITICAL FIX: to_date must be YESTERDAY (completed day)
+            # Upstox historical API does NOT include current day
             to_date = (datetime.now(IST) - timedelta(days=1)).date()  # Yesterday
-            from_date = (datetime.now(IST) - timedelta(days=days)).date()
+            from_date = (datetime.now(IST) - timedelta(days=days)).date()  # 5 days ago
+            
+            # Double check: Don't fetch if weekend
+            if to_date.weekday() >= 5:  # Saturday/Sunday
+                # Move to last Friday
+                days_back = to_date.weekday() - 4
+                to_date = to_date - timedelta(days=days_back)
             
             encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
             
             url = f"https://api.upstox.com/v2/historical-candle/{encoded_symbol}/5minute/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
             
-            logger.info(f"  📥 Fetching historical data ({from_date} to {to_date})...")
+            logger.info(f"  📥 Fetching historical ({from_date} to {to_date} - COMPLETED days only)...")
+            logger.info(f"  🔗 URL: {url}")
             response = requests.get(url, headers=self.headers, timeout=30)
             
             if response.status_code == 200:
                 data = response.json()
+                logger.info(f"  📊 Historical Response Status: {data.get('status', 'unknown')}")
+                
                 if 'data' in data and 'candles' in data['data']:
-                    df = pd.DataFrame(
-                        data['data']['candles'],
-                        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
-                    )
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df = df.sort_values('timestamp').reset_index(drop=True)
-                    logger.info(f"  ✅ Fetched {len(df)} historical candles")
-                    return df
+                    candles = data['data']['candles']
+                    if len(candles) > 0:
+                        df = pd.DataFrame(
+                            candles,
+                            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
+                        )
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        df = df.sort_values('timestamp').reset_index(drop=True)
+                        logger.info(f"  ✅ Fetched {len(df)} historical candles")
+                        return df
+                    else:
+                        logger.warning(f"  ⚠️ Historical API returned 0 candles")
+                else:
+                    logger.warning(f"  ⚠️ Unexpected historical response structure")
+                    logger.warning(f"  Response: {json.dumps(data, indent=2)[:500]}")
+            else:
+                logger.warning(f"  ⚠️ Historical API returned {response.status_code}")
+                try:
+                    error_data = response.json()
+                    logger.warning(f"  Error: {json.dumps(error_data, indent=2)}")
+                except:
+                    logger.warning(f"  Response: {response.text[:300]}")
             
-            logger.warning(f"  ⚠️ Historical API returned {response.status_code}")
             return pd.DataFrame()
             
         except Exception as e:
@@ -425,37 +469,40 @@ class UpstoxDataFetcher:
     def get_combined_data(self) -> pd.DataFrame:
         """Combine Historical + Intraday data for complete picture"""
         try:
-            # Step 1: Get historical data (past days)
-            df_historical = self.get_historical_data(days=3)
+            # Step 1: Try historical first
+            df_historical = self.get_historical_data(days=5)
             
-            # Step 2: Get today's intraday data
+            # Step 2: Try intraday
             df_intraday = self.get_intraday_data()
             
-            # Step 3: Combine both
+            # Step 3: Combine logic
             if not df_historical.empty and not df_intraday.empty:
+                logger.info(f"  ✅ Combining historical ({len(df_historical)}) + intraday ({len(df_intraday)})")
                 df_combined = pd.concat([df_historical, df_intraday])
             elif not df_intraday.empty:
+                logger.info(f"  ✅ Using only intraday data ({len(df_intraday)} candles)")
                 df_combined = df_intraday
             elif not df_historical.empty:
+                logger.info(f"  ✅ Using only historical data ({len(df_historical)} candles)")
                 df_combined = df_historical
             else:
-                logger.error("  ❌ No data available from both APIs")
+                logger.error("  ❌ No data from both APIs - check credentials/network")
                 return pd.DataFrame()
             
-            # Remove duplicates and sort
+            # Clean and prepare
             df_combined = df_combined.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
-            
-            # Keep last 500 candles max
             df_combined = df_combined.tail(500).reset_index(drop=True)
             
-            first_time = df_combined.iloc[0]['timestamp'].strftime('%d-%b %H:%M')
-            last_time = df_combined.iloc[-1]['timestamp'].strftime('%d-%b %H:%M')
-            logger.info(f"  ✅ Combined: {len(df_combined)} candles ({first_time} to {last_time})")
+            if len(df_combined) > 0:
+                first_time = df_combined.iloc[0]['timestamp'].strftime('%d-%b %H:%M')
+                last_time = df_combined.iloc[-1]['timestamp'].strftime('%d-%b %H:%M')
+                logger.info(f"  ✅ Final dataset: {len(df_combined)} candles ({first_time} to {last_time})")
             
             return df_combined
             
         except Exception as e:
             logger.error(f"  ❌ Combined data error: {e}")
+            traceback.print_exc()
             return pd.DataFrame()
     
     def get_ltp(self) -> float:
