@@ -359,12 +359,15 @@ class UpstoxDataFetcher:
     def get_intraday_data(self) -> pd.DataFrame:
         """Fetch TODAY'S live 5-minute candles using Intraday API"""
         try:
+            # CRITICAL: Use proper encoding for NIFTY symbol
+            # Upstox expects: NSE_INDEX%7CNifty%2050
             encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
             
             # Intraday API - Today's live data
             url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_symbol}/5minute"
             
-            logger.info(f"  📥 Fetching TODAY's intraday data...")
+            logger.info(f"  📥 Fetching intraday data...")
+            logger.info(f"  🔗 URL: {url}")
             response = requests.get(url, headers=self.headers, timeout=30)
             
             if response.status_code == 200:
@@ -725,33 +728,58 @@ class AIAnalyzer:
             recent_closes = df_tail['close'].tail(10).values
             bullish_candles = sum(1 for i in range(1, len(recent_closes)) if recent_closes[i] > recent_closes[i-1])
             
-            prompt = f"""NIFTY50 5-MIN ANALYSIS
+            # Get OI snapshots for velocity calculation
+            oi_15m_ago = RedisOIManager.get_oi_snapshot(15)
+            oi_30m_ago = RedisOIManager.get_oi_snapshot(30)
+            
+            # Calculate PCR changes
+            pcr_15m = oi_15m_ago.pcr if oi_15m_ago else current_oi.pcr
+            pcr_30m = oi_30m_ago.pcr if oi_30m_ago else current_oi.pcr
+            
+            prompt = f"""Elite F&O Trader | NIFTY50 5-MIN
 
 PRICE: ₹{current_price:.2f} | TIME: {datetime.now(IST).strftime('%H:%M')}
 
-**5-MIN CANDLES (Last 420):**
-Time |Open |High |Low  |Close|Volume
+CANDLES (Last 420):
+Time|O|H|L|C|Vol
 {candles_compressed}
 
-**OPTION CHAIN (ATM ±10 strikes):**
-Strike|C_OI  |C_ΔOI |C_Vol|P_OI  |P_ΔOI |P_Vol
+OPTION CHAIN (ATM±10):
+Strike|C_OI|C_ΔOI|C_Vol|P_OI|P_ΔOI|P_Vol
 {oi_compressed}
 
-**METRICS:**
-PCR: {current_oi.pcr:.2f} | MaxPain: {current_oi.max_pain}
-Support: {','.join(map(str, current_oi.support_strikes))}
-Resistance: {','.join(map(str, current_oi.resistance_strikes))}
-Momentum: {price_momentum:+.2f}% | SMA20: ₹{sma_20:.1f}
-Bullish Candles (Last 10): {bullish_candles}/10
+METRICS:
+PCR: Now {current_oi.pcr:.2f} | 15m {pcr_15m:.2f} | 30m {pcr_30m:.2f}
+MaxPain: {current_oi.max_pain} | S/R: {'/'.join(map(str, current_oi.support_strikes[:2]))}/{'/'.join(map(str, current_oi.resistance_strikes[:2]))}
 
-**TASK:** Analyze price action + OI fusion on 5-MIN timeframe. Focus on:
-• Entry patterns & momentum shifts
-• Volume surges & price breakouts
-• OI buildup/unwinding (C_ΔOI, P_ΔOI)
-• Support/Resistance levels
-• PCR positioning
+ANALYZE (Price+Vol+OI FUSION):
 
-**OUTPUT JSON:**
+1. OI VELOCITY (15-30m):
+CE/PE buildup/unwind | Velocity: 15m>30m=accel | PCR trend | Strike focus (ATM/OTM)
+Price+OI sync: ↑CE↑=bull | ↓PE↑=bear | Mismatch=reversal
+
+2. PATTERN (3): Bearish(Speed/Slow) | Bullish(Speed/Slow) | Sideways(Range/Trap)
+OI support? Active?
+
+3. VOLUME (5): Buying(green+vol) | Selling(red+vol) | Churning(small+HIGH vol=TRAP) | Drying(move+low vol=exhaust) | Climax(spike+long=reverse)
+Type? OI velocity match?
+
+4. NAKED OPTIONS (4): CallBuy(CE OTM buildup) | PutBuy(PE OTM buildup) | CallSell(CE resist) | PutSell(PE support)
+15-30m dominant?
+
+5. COMBO:
+BULL=CallBuy+PutSell+BuyVol+OI(sustained)
+BEAR=PutBuy+CallSell+SellVol+OI(sustained)
+TRAP=HighVol+SmallCandle+OI(15m spike)
+REVERSAL=LowVol+BigMove+OI(unwind)
+
+6. SYNC: Price velocity vs OI velocity | Fast+Fast=strong | Fast+Slow=weak | Slow+Fast=coiling
+
+7. TRIPLE CONFIRM: Pattern+Vol+OI aligned? Fakeout: Price/Vol WITHOUT OI
+
+8. SMART MONEY: CallWrite+rise(30m)=resist | PutWrite+fall(30m)=support | Sudden(15m) vs Gradual(30m)
+
+OUTPUT JSON:
 {{
   "signal_type": "CE_BUY/PE_BUY/NO_TRADE",
   "confidence": 85,
@@ -761,14 +789,14 @@ Bullish Candles (Last 10): {bullish_candles}/10
   "target_2": 0.0,
   "risk_reward": "1:2.5",
   "recommended_strike": {round(current_price/50)*50},
-  "reasoning": "Brief reasoning (max 150 chars)",
-  "price_analysis": "Price action summary (max 200 chars)",
-  "oi_analysis": "OI flow summary (max 200 chars)",
+  "reasoning": "1-line why (max 120 chars)",
+  "price_analysis": "Price+Vol fusion (max 150 chars)",
+  "oi_analysis": "OI velocity 15-30m edge (max 150 chars)",
   "alignment_score": 8,
-  "risk_factors": ["Risk 1", "Risk 2"],
+  "risk_factors": ["Risk1", "Risk2"],
   "support_levels": [0.0, 0.0],
   "resistance_levels": [0.0, 0.0],
-  "pattern_detected": "Pattern name or None"
+  "pattern_detected": "Pattern or None"
 }}"""
             
             response = requests.post(
