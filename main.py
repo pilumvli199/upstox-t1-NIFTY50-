@@ -1,67 +1,42 @@
 #!/usr/bin/env python3
 """
-NIFTY OPTIONS BOT V13.3 - COMPLETE PRODUCTION VERSION
-======================================================
-✅ All 4 Indices: NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY
-✅ Real-time Option Chain Analysis
-✅ OI Change Tracking (5min & 15min)
-✅ PCR Analysis
-✅ Volume Surge Detection
-✅ Telegram Alerts
-✅ Memory System (RAM/Redis)
+MULTI-INDEX DATA FETCHING TEST - V1.0
+=====================================
+✅ Test data fetching for all 4 indices
+✅ Verify Upstox API responses
+✅ Check data quality
 
-Author: Complete Production Version
+TESTING:
+- Spot prices
+- Futures candles
+- Option chain (5 strikes)
+
+Author: Data Fetching Test Version
 Date: November 24, 2025
 """
 
-import os
 import asyncio
 import aiohttp
 import json
-import logging
 from datetime import datetime, timedelta, time
-import pytz
 from calendar import monthrange
-from typing import Optional, Dict, Tuple, List
-from dataclasses import dataclass
-
-# Optional imports
-try:
-    import redis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
-    print("⚠️ Redis not available, using RAM mode")
-
-try:
-    from telegram import Bot
-    TELEGRAM_AVAILABLE = True
-except ImportError:
-    TELEGRAM_AVAILABLE = False
-    print("⚠️ Telegram not available, alerts disabled")
+import pytz
+from typing import Dict, Tuple, Optional
+import pandas as pd
 
 # ==================== CONFIGURATION ====================
 IST = pytz.timezone('Asia/Kolkata')
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger("MultiIndexBot-V13.3")
 
-# Environment Variables
-UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', 'YOUR_TOKEN_HERE')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
+# ⚠️ PUT YOUR UPSTOX TOKEN HERE
+UPSTOX_ACCESS_TOKEN = 'YOUR_TOKEN_HERE'
 
-# ✅ ALL 4 INDICES CONFIGURATION
+# ✅ ALL 4 INDICES - VERIFIED INSTRUMENT KEYS
 INDICES = {
     'NIFTY': {
         'spot': "NSE_INDEX|Nifty 50",
         'name': 'NIFTY 50',
         'strike_gap': 50,
         'has_weekly': True,
-        'expiry_day': 1,
         'futures_prefix': 'NIFTY'
     },
     'BANKNIFTY': {
@@ -69,7 +44,6 @@ INDICES = {
         'name': 'BANK NIFTY',
         'strike_gap': 100,
         'has_weekly': False,
-        'expiry_day': 1,
         'futures_prefix': 'BANKNIFTY'
     },
     'FINNIFTY': {
@@ -77,7 +51,6 @@ INDICES = {
         'name': 'FIN NIFTY',
         'strike_gap': 50,
         'has_weekly': False,
-        'expiry_day': 1,
         'futures_prefix': 'FINNIFTY'
     },
     'MIDCPNIFTY': {
@@ -85,779 +58,419 @@ INDICES = {
         'name': 'MIDCAP NIFTY',
         'strike_gap': 25,
         'has_weekly': False,
-        'expiry_day': 1,
         'futures_prefix': 'MIDCPNIFTY'
     }
 }
 
-# 🔥 ALL INDICES ACTIVE
-ACTIVE_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
+# Test only these indices
+TEST_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
 
-# Trading Configuration
-ALERT_ONLY_MODE = True
-SCAN_INTERVAL = 60  # seconds between full scans
-INDEX_SCAN_DELAY = 2  # delay between indices
-
-# Strategy Thresholds
-OI_THRESHOLD_STRONG = 8.0
-OI_THRESHOLD_MEDIUM = 5.0
-ATM_OI_THRESHOLD = 5.0
-
-VOL_SPIKE_2X = 2.0
-VOL_SPIKE_3X = 3.0
-
-PCR_BULLISH = 1.08
-PCR_BEARISH = 0.92
-
-# Time Filters
-AVOID_OPENING = (time(9, 15), time(9, 45))
-AVOID_CLOSING = (time(15, 15), time(15, 30))
-
-# ==================== DATA STRUCTURES ====================
-@dataclass
-class Signal:
-    """Trading Signal"""
-    index_name: str
-    type: str  # CE_BUY or PE_BUY
-    reason: str
-    confidence: int
-    spot_price: float
-    strike: int
-    target_points: int
-    stop_loss_points: int
-    pcr: float
-    atm_ce_change: float
-    atm_pe_change: float
-    ce_total_15m: float
-    pe_total_15m: float
-    ce_total_5m: float
-    pe_total_5m: float
-    volume_surge: float
-    timestamp: datetime
-
-# ==================== MEMORY SYSTEM ====================
-class MemorySystem:
-    """Unified memory system (Redis or RAM)"""
+# ==================== HELPER FUNCTIONS ====================
+def get_current_futures_symbol(index_name: str) -> str:
+    """
+    Generate current month futures symbol
+    Format: NSE_FO|NIFTY24DECFUT
+    """
+    now = datetime.now(IST)
+    year = now.year
+    month = now.month
     
-    def __init__(self):
-        self.use_redis = False
-        self.redis_client = None
-        self.ram_storage = {
-            'strike_snapshots': {},  # {index: {strike: {timestamp: data}}}
-            'total_oi': {},  # {index: {timestamp: {ce, pe}}}
-            'volume_history': {}  # {index: [{time, volume}]}
-        }
-        
-        # Try Redis
-        if REDIS_AVAILABLE:
-            try:
-                self.redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-                self.redis_client.ping()
-                self.use_redis = True
-                logger.info("✅ Redis Connected")
-            except:
-                logger.info("📦 Using RAM mode")
+    # Find last Tuesday of current month
+    last_day = monthrange(year, month)[1]
+    last_date = datetime(year, month, last_day, tzinfo=IST)
+    days_to_tuesday = (last_date.weekday() - 1) % 7
+    last_tuesday = last_date - timedelta(days=days_to_tuesday)
+    
+    # If already past expiry, move to next month
+    if now.date() > last_tuesday.date() or (
+        now.date() == last_tuesday.date() and now.time() > time(15, 30)
+    ):
+        if month == 12:
+            year += 1
+            month = 1
         else:
-            logger.info("📦 RAM-only mode")
+            month += 1
     
-    def _clean_old_data(self, data_dict: dict, minutes: int = 30):
-        """Remove data older than specified minutes"""
-        cutoff = datetime.now(IST) - timedelta(minutes=minutes)
-        return {
-            ts: d for ts, d in data_dict.items()
-            if isinstance(ts, datetime) and ts > cutoff
-        }
+    # Format: NIFTY24DEC
+    year_short = year % 100
+    month_name = datetime(year, month, 1).strftime('%b').upper()
     
-    # ===== STRIKE SNAPSHOTS =====
-    def save_strike_snapshot(self, index_name: str, strike_data: Dict[int, dict]):
-        """Save strike-level OI data"""
-        now = datetime.now(IST)
-        timestamp = now.replace(second=0, microsecond=0)
+    prefix = INDICES[index_name]['futures_prefix']
+    symbol = f"NSE_FO|{prefix}{year_short:02d}{month_name}FUT"
+    
+    return symbol
+
+def get_expiry_date(index_name: str) -> str:
+    """
+    Get expiry date in YYYY-MM-DD format
+    """
+    now = datetime.now(IST)
+    today = now.date()
+    config = INDICES[index_name]
+    
+    if config['has_weekly']:
+        # NIFTY: Next Tuesday
+        days_to_tuesday = (1 - today.weekday() + 7) % 7
         
-        for strike, data in strike_data.items():
-            key = f"{index_name}:strike:{strike}:{timestamp.strftime('%H%M')}"
-            value = json.dumps(data)
-            
-            if self.use_redis:
-                try:
-                    self.redis_client.setex(key, 3600, value)
-                except:
-                    # Fallback to RAM
-                    if index_name not in self.ram_storage['strike_snapshots']:
-                        self.ram_storage['strike_snapshots'][index_name] = {}
-                    if strike not in self.ram_storage['strike_snapshots'][index_name]:
-                        self.ram_storage['strike_snapshots'][index_name][strike] = {}
-                    self.ram_storage['strike_snapshots'][index_name][strike][timestamp] = data
+        if days_to_tuesday == 0:
+            if now.time() > time(15, 30):
+                expiry = today + timedelta(days=7)
             else:
-                # RAM mode
-                if index_name not in self.ram_storage['strike_snapshots']:
-                    self.ram_storage['strike_snapshots'][index_name] = {}
-                if strike not in self.ram_storage['strike_snapshots'][index_name]:
-                    self.ram_storage['strike_snapshots'][index_name][strike] = {}
-                self.ram_storage['strike_snapshots'][index_name][strike][timestamp] = data
-        
-        # Clean old data in RAM mode
-        if not self.use_redis and index_name in self.ram_storage['strike_snapshots']:
-            for strike in self.ram_storage['strike_snapshots'][index_name]:
-                self.ram_storage['strike_snapshots'][index_name][strike] = \
-                    self._clean_old_data(self.ram_storage['strike_snapshots'][index_name][strike])
-    
-    def get_strike_oi_change(self, index_name: str, strike: int, 
-                            current_data: dict, minutes_ago: int = 15) -> Tuple[float, float]:
-        """Calculate OI change for specific strike"""
-        now = datetime.now(IST) - timedelta(minutes=minutes_ago)
-        timestamp = now.replace(second=0, microsecond=0)
-        key = f"{index_name}:strike:{strike}:{timestamp.strftime('%H%M')}"
-        
-        past_data_str = None
-        
-        if self.use_redis:
-            try:
-                past_data_str = self.redis_client.get(key)
-            except:
-                pass
-        
-        if not past_data_str and index_name in self.ram_storage['strike_snapshots']:
-            if strike in self.ram_storage['strike_snapshots'][index_name]:
-                snapshots = self.ram_storage['strike_snapshots'][index_name][strike]
-                past_times = [t for t in snapshots.keys() if t <= timestamp]
-                if past_times:
-                    closest = max(past_times)
-                    past_data_str = json.dumps(snapshots[closest])
-        
-        if not past_data_str:
-            return 0.0, 0.0
-        
-        try:
-            past = json.loads(past_data_str)
-            ce_chg = ((current_data['ce_oi'] - past['ce_oi']) / past['ce_oi'] * 100
-                      if past['ce_oi'] > 0 else 0)
-            pe_chg = ((current_data['pe_oi'] - past['pe_oi']) / past['pe_oi'] * 100
-                      if past['pe_oi'] > 0 else 0)
-            return ce_chg, pe_chg
-        except:
-            return 0.0, 0.0
-    
-    # ===== TOTAL OI =====
-    def save_total_oi(self, index_name: str, ce_total: int, pe_total: int):
-        """Save total OI snapshot"""
-        now = datetime.now(IST)
-        timestamp = now.replace(second=0, microsecond=0)
-        key = f"{index_name}:total_oi:{timestamp.strftime('%H%M')}"
-        data = json.dumps({"ce": ce_total, "pe": pe_total})
-        
-        if self.use_redis:
-            try:
-                self.redis_client.setex(key, 3600, data)
-            except:
-                if index_name not in self.ram_storage['total_oi']:
-                    self.ram_storage['total_oi'][index_name] = {}
-                self.ram_storage['total_oi'][index_name][timestamp] = {"ce": ce_total, "pe": pe_total}
+                expiry = today
         else:
-            if index_name not in self.ram_storage['total_oi']:
-                self.ram_storage['total_oi'][index_name] = {}
-            self.ram_storage['total_oi'][index_name][timestamp] = {"ce": ce_total, "pe": pe_total}
-        
-        # Clean old data
-        if not self.use_redis and index_name in self.ram_storage['total_oi']:
-            self.ram_storage['total_oi'][index_name] = \
-                self._clean_old_data(self.ram_storage['total_oi'][index_name])
+            expiry = today + timedelta(days=days_to_tuesday)
     
-    def get_total_oi_change(self, index_name: str, current_ce: int, 
-                           current_pe: int, minutes_ago: int = 15) -> Tuple[float, float]:
-        """Get total OI change"""
-        now = datetime.now(IST) - timedelta(minutes=minutes_ago)
-        timestamp = now.replace(second=0, microsecond=0)
-        key = f"{index_name}:total_oi:{timestamp.strftime('%H%M')}"
+    else:
+        # Others: Last Tuesday of month
+        year = now.year
+        month = now.month
         
-        past_data = None
+        last_day = monthrange(year, month)[1]
+        last_date = datetime(year, month, last_day)
         
-        if self.use_redis:
-            try:
-                past_data_str = self.redis_client.get(key)
-                if past_data_str:
-                    past_data = json.loads(past_data_str)
-            except:
-                pass
+        days_to_tuesday = (last_date.weekday() - 1) % 7
+        last_tuesday = last_date - timedelta(days=days_to_tuesday)
         
-        if not past_data and index_name in self.ram_storage['total_oi']:
-            snapshots = self.ram_storage['total_oi'][index_name]
-            past_times = [t for t in snapshots.keys() if t <= timestamp]
-            if past_times:
-                closest = max(past_times)
-                past_data = snapshots[closest]
+        if now.date() > last_tuesday.date() or (
+            now.date() == last_tuesday.date() and now.time() > time(15, 30)
+        ):
+            if month == 12:
+                year += 1
+                month = 1
+            else:
+                month += 1
+            
+            last_day = monthrange(year, month)[1]
+            last_date = datetime(year, month, last_day)
+            days_to_tuesday = (last_date.weekday() - 1) % 7
+            last_tuesday = last_date - timedelta(days=days_to_tuesday)
         
-        if not past_data:
-            return 0.0, 0.0
-        
-        try:
-            ce_chg = ((current_ce - past_data['ce']) / past_data['ce'] * 100
-                      if past_data['ce'] > 0 else 0)
-            pe_chg = ((current_pe - past_data['pe']) / past_data['pe'] * 100
-                      if past_data['pe'] > 0 else 0)
-            return ce_chg, pe_chg
-        except:
-            return 0.0, 0.0
+        expiry = last_tuesday.date()
     
-    # ===== VOLUME TRACKING =====
-    def track_volume(self, index_name: str, volume: float) -> Tuple[bool, float]:
-        """Track volume and detect spikes"""
-        now = datetime.now(IST)
-        
-        if index_name not in self.ram_storage['volume_history']:
-            self.ram_storage['volume_history'][index_name] = []
-        
-        self.ram_storage['volume_history'][index_name].append({
-            'time': now,
-            'volume': volume
-        })
-        
-        # Clean old data (keep last 20 minutes)
-        cutoff = now - timedelta(minutes=20)
-        self.ram_storage['volume_history'][index_name] = [
-            v for v in self.ram_storage['volume_history'][index_name]
-            if v['time'] > cutoff
-        ]
-        
-        history = self.ram_storage['volume_history'][index_name]
-        
-        if len(history) < 5:
-            return False, 0.0
-        
-        past_volumes = [v['volume'] for v in history[:-1]]
-        avg_vol = sum(past_volumes) / len(past_volumes)
-        
-        if avg_vol == 0:
-            return False, 0.0
-        
-        multiplier = volume / avg_vol
-        has_spike = multiplier >= VOL_SPIKE_2X
-        
-        return has_spike, multiplier
+    return expiry.strftime('%Y-%m-%d')
 
-# ==================== DATA FEED ====================
-class DataFeed:
-    """Fetch market data from Upstox"""
+# ==================== DATA FETCHER ====================
+class DataFetcher:
+    """Fetch and test data for one index"""
     
     def __init__(self, index_name: str):
         self.index_name = index_name
         self.config = INDICES[index_name]
         self.spot_symbol = self.config['spot']
         self.strike_gap = self.config['strike_gap']
+        
         self.headers = {
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
+        
+        self.results = {
+            'spot': {'status': 'pending', 'data': None, 'error': None},
+            'futures': {'status': 'pending', 'data': None, 'error': None},
+            'options': {'status': 'pending', 'data': None, 'error': None}
+        }
     
     def encode_symbol(self, symbol: str) -> str:
-        """Proper URL encoding"""
+        """Proper URL encoding for Upstox"""
         return symbol.replace('|', '%7C').replace(' ', '%20')
     
-    def get_expiry_date(self) -> str:
-        """Calculate expiry date"""
-        now = datetime.now(IST)
-        today = now.date()
-        
-        if self.config['has_weekly']:
-            # NIFTY: Next Tuesday
-            days_to_tuesday = (1 - today.weekday() + 7) % 7
-            if days_to_tuesday == 0:
-                expiry = today if now.time() <= time(15, 30) else today + timedelta(days=7)
-            else:
-                expiry = today + timedelta(days=days_to_tuesday)
-        else:
-            # Monthly: Last Tuesday
-            year, month = now.year, now.month
-            last_day = monthrange(year, month)[1]
-            last_date = datetime(year, month, last_day)
-            days_to_tuesday = (last_date.weekday() - 1) % 7
-            last_tuesday = last_date - timedelta(days=days_to_tuesday)
-            
-            if now.date() > last_tuesday.date() or (
-                now.date() == last_tuesday.date() and now.time() > time(15, 30)
-            ):
-                month += 1
-                if month > 12:
-                    year += 1
-                    month = 1
-                
-                last_day = monthrange(year, month)[1]
-                last_date = datetime(year, month, last_day)
-                days_to_tuesday = (last_date.weekday() - 1) % 7
-                last_tuesday = last_date - timedelta(days=days_to_tuesday)
-            
-            expiry = last_tuesday.date()
-        
-        return expiry.strftime('%Y-%m-%d')
+    async def fetch_url(self, url: str, session: aiohttp.ClientSession) -> Optional[dict]:
+        """Fetch URL with error handling"""
+        try:
+            async with session.get(url, headers=self.headers, 
+                                 timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    error_text = await resp.text()
+                    return {'error': f'HTTP {resp.status}', 'details': error_text}
+        except Exception as e:
+            return {'error': str(e)}
     
-    async def fetch_with_retry(self, url: str, session: aiohttp.ClientSession, retries: int = 3):
-        """Fetch with retry"""
-        for attempt in range(retries):
-            try:
-                async with session.get(url, headers=self.headers, 
-                                     timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 429:
-                        wait = 2 ** attempt
-                        logger.warning(f"⏳ [{self.index_name}] Rate limit, wait {wait}s")
-                        await asyncio.sleep(wait)
-                    else:
-                        logger.error(f"❌ [{self.index_name}] HTTP {resp.status}")
-                        await asyncio.sleep(2)
-            except Exception as e:
-                logger.error(f"💥 [{self.index_name}] Attempt {attempt+1}: {e}")
-                await asyncio.sleep(2 * (attempt + 1))
+    async def test_spot_price(self, session: aiohttp.ClientSession):
+        """Test 1: Fetch spot price"""
+        print(f"\n📊 [{self.config['name']}] Testing Spot Price...")
+        print(f"   Symbol: {self.spot_symbol}")
         
-        return None
-    
-    async def get_market_data(self) -> Tuple[float, Dict[int, dict], str, float]:
-        """Fetch spot price and option chain"""
-        async with aiohttp.ClientSession() as session:
-            # Get spot price
-            spot_encoded = self.encode_symbol(self.spot_symbol)
-            ltp_url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={spot_encoded}"
-            
-            ltp_data = await self.fetch_with_retry(ltp_url, session)
-            
+        spot_encoded = self.encode_symbol(self.spot_symbol)
+        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={spot_encoded}"
+        
+        print(f"   URL: {url}")
+        
+        result = await self.fetch_url(url, session)
+        
+        if result and 'data' in result:
+            # Try different possible keys
             spot_price = 0
-            if ltp_data and 'data' in ltp_data:
-                for key in [self.spot_symbol, 
-                           self.spot_symbol.replace('NSE_INDEX|', 'NSE_INDEX:')]:
-                    if key in ltp_data['data']:
-                        spot_price = ltp_data['data'][key].get('last_price', 0)
-                        if spot_price > 0:
-                            break
+            found_key = None
             
-            if spot_price == 0:
-                logger.error(f"❌ [{self.index_name}] Failed to get spot")
-                return 0, {}, "", 0
+            for key in [self.spot_symbol, 
+                       self.spot_symbol.replace('NSE_INDEX|', 'NSE_INDEX:')]:
+                if key in result['data']:
+                    spot_price = result['data'][key].get('last_price', 0)
+                    found_key = key
+                    break
             
-            # Get option chain
-            expiry = self.get_expiry_date()
-            chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={spot_encoded}&expiry_date={expiry}"
+            if spot_price > 0:
+                self.results['spot']['status'] = 'success'
+                self.results['spot']['data'] = {
+                    'price': spot_price,
+                    'key_used': found_key
+                }
+                print(f"   ✅ SUCCESS: {spot_price}")
+            else:
+                self.results['spot']['status'] = 'failed'
+                self.results['spot']['error'] = 'Price not found in response'
+                print(f"   ❌ FAILED: Price not found")
+                print(f"   Response keys: {list(result.get('data', {}).keys())}")
+        else:
+            self.results['spot']['status'] = 'failed'
+            self.results['spot']['error'] = result.get('error', 'Unknown error')
+            print(f"   ❌ FAILED: {result.get('error')}")
+    
+    async def test_futures_candles(self, session: aiohttp.ClientSession):
+        """Test 2: Fetch futures candles"""
+        print(f"\n📈 [{self.config['name']}] Testing Futures Candles...")
+        
+        futures_symbol = get_current_futures_symbol(self.index_name)
+        print(f"   Symbol: {futures_symbol}")
+        
+        futures_encoded = self.encode_symbol(futures_symbol)
+        to_date = datetime.now(IST).strftime('%Y-%m-%d')
+        from_date = (datetime.now(IST) - timedelta(days=10)).strftime('%Y-%m-%d')
+        
+        url = f"https://api.upstox.com/v2/historical-candle/{futures_encoded}/1minute/{to_date}/{from_date}"
+        
+        print(f"   URL: {url}")
+        
+        result = await self.fetch_url(url, session)
+        
+        if result and result.get('status') == 'success':
+            candles = result.get('data', {}).get('candles', [])
             
-            chain_data = await self.fetch_with_retry(chain_url, session)
+            if candles:
+                # Convert to DataFrame
+                df = pd.DataFrame(
+                    candles,
+                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
+                )
+                df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert(IST)
+                
+                # Filter today's data
+                today = datetime.now(IST).date()
+                df = df[df['timestamp'].dt.date == today]
+                
+                if not df.empty:
+                    latest = df.iloc[-1]
+                    self.results['futures']['status'] = 'success'
+                    self.results['futures']['data'] = {
+                        'total_candles': len(df),
+                        'latest_price': latest['close'],
+                        'latest_time': latest['timestamp'].strftime('%H:%M:%S'),
+                        'sample_candle': latest.to_dict()
+                    }
+                    print(f"   ✅ SUCCESS: {len(df)} candles")
+                    print(f"   Latest: {latest['close']} @ {latest['timestamp'].strftime('%H:%M:%S')}")
+                else:
+                    self.results['futures']['status'] = 'failed'
+                    self.results['futures']['error'] = 'No candles for today'
+                    print(f"   ⚠️ WARNING: No candles for today")
+            else:
+                self.results['futures']['status'] = 'failed'
+                self.results['futures']['error'] = 'Empty candles array'
+                print(f"   ❌ FAILED: Empty candles")
+        else:
+            self.results['futures']['status'] = 'failed'
+            self.results['futures']['error'] = result.get('error', 'Unknown error')
+            print(f"   ❌ FAILED: {result.get('error')}")
+    
+    async def test_option_chain(self, session: aiohttp.ClientSession):
+        """Test 3: Fetch option chain"""
+        print(f"\n⚔️ [{self.config['name']}] Testing Option Chain...")
+        
+        # Need spot price first
+        if self.results['spot']['status'] != 'success':
+            print(f"   ⚠️ SKIPPED: Need spot price first")
+            return
+        
+        spot_price = self.results['spot']['data']['price']
+        expiry = get_expiry_date(self.index_name)
+        
+        print(f"   Spot: {spot_price}")
+        print(f"   Expiry: {expiry}")
+        
+        spot_encoded = self.encode_symbol(self.spot_symbol)
+        url = f"https://api.upstox.com/v2/option/chain?instrument_key={spot_encoded}&expiry_date={expiry}"
+        
+        print(f"   URL: {url}")
+        
+        result = await self.fetch_url(url, session)
+        
+        if result and result.get('status') == 'success':
+            all_options = result.get('data', [])
+            
+            # Filter 5 strikes around ATM
+            atm_strike = round(spot_price / self.strike_gap) * self.strike_gap
+            min_strike = atm_strike - (2 * self.strike_gap)
+            max_strike = atm_strike + (2 * self.strike_gap)
+            
+            print(f"   ATM: {atm_strike}")
+            print(f"   Range: {min_strike} to {max_strike}")
             
             strike_data = {}
-            total_volume = 0
+            total_ce_oi = 0
+            total_pe_oi = 0
             
-            if chain_data and chain_data.get('status') == 'success':
-                atm_strike = round(spot_price / self.strike_gap) * self.strike_gap
-                min_strike = atm_strike - (2 * self.strike_gap)
-                max_strike = atm_strike + (2 * self.strike_gap)
+            for option in all_options:
+                strike = option.get('strike_price', 0)
                 
-                for option in chain_data.get('data', []):
-                    strike = option.get('strike_price', 0)
+                if min_strike <= strike <= max_strike:
+                    call_data = option.get('call_options', {}).get('market_data', {})
+                    put_data = option.get('put_options', {}).get('market_data', {})
                     
-                    if min_strike <= strike <= max_strike:
-                        call_data = option.get('call_options', {}).get('market_data', {})
-                        put_data = option.get('put_options', {}).get('market_data', {})
-                        
-                        strike_data[strike] = {
-                            'ce_oi': call_data.get('oi', 0),
-                            'pe_oi': put_data.get('oi', 0),
-                            'ce_vol': call_data.get('volume', 0),
-                            'pe_vol': put_data.get('volume', 0),
-                            'ce_ltp': call_data.get('ltp', 0),
-                            'pe_ltp': put_data.get('ltp', 0)
-                        }
-                        
-                        total_volume += (call_data.get('volume', 0) + put_data.get('volume', 0))
+                    ce_oi = call_data.get('oi', 0)
+                    pe_oi = put_data.get('oi', 0)
+                    
+                    strike_data[strike] = {
+                        'ce_oi': ce_oi,
+                        'pe_oi': pe_oi,
+                        'ce_ltp': call_data.get('ltp', 0),
+                        'pe_ltp': put_data.get('ltp', 0),
+                        'ce_volume': call_data.get('volume', 0),
+                        'pe_volume': put_data.get('volume', 0)
+                    }
+                    
+                    total_ce_oi += ce_oi
+                    total_pe_oi += pe_oi
             
-            return spot_price, strike_data, expiry, total_volume
-
-# ==================== ANALYZER ====================
-class Analyzer:
-    """Signal generation with full logic"""
-    
-    def __init__(self, index_name: str, memory: MemorySystem):
-        self.index_name = index_name
-        self.config = INDICES[index_name]
-        self.memory = memory
-    
-    def calculate_pcr(self, strike_data: Dict[int, dict]) -> float:
-        """Calculate PCR"""
-        total_ce = sum(d['ce_oi'] for d in strike_data.values())
-        total_pe = sum(d['pe_oi'] for d in strike_data.values())
-        return total_pe / total_ce if total_ce > 0 else 1.0
-    
-    def analyze(self, spot_price: float, strike_data: Dict[int, dict], 
-                total_volume: float) -> Optional[Signal]:
-        """Generate signal with complete logic"""
-        if not strike_data or spot_price == 0:
-            return None
-        
-        # Save data
-        self.memory.save_strike_snapshot(self.index_name, strike_data)
-        
-        total_ce = sum(d['ce_oi'] for d in strike_data.values())
-        total_pe = sum(d['pe_oi'] for d in strike_data.values())
-        self.memory.save_total_oi(self.index_name, total_ce, total_pe)
-        
-        # Calculate metrics
-        pcr = self.calculate_pcr(strike_data)
-        atm_strike = round(spot_price / self.config['strike_gap']) * self.config['strike_gap']
-        
-        # ATM analysis
-        atm_ce_change = 0.0
-        atm_pe_change = 0.0
-        
-        if atm_strike in strike_data:
-            atm_data = strike_data[atm_strike]
-            atm_ce_change, atm_pe_change = self.memory.get_strike_oi_change(
-                self.index_name, atm_strike, atm_data, minutes_ago=15
-            )
-        
-        # Total OI changes
-        ce_total_15m, pe_total_15m = self.memory.get_total_oi_change(
-            self.index_name, total_ce, total_pe, minutes_ago=15
-        )
-        ce_total_5m, pe_total_5m = self.memory.get_total_oi_change(
-            self.index_name, total_ce, total_pe, minutes_ago=5
-        )
-        
-        # Volume analysis
-        has_vol_spike, vol_mult = self.memory.track_volume(self.index_name, total_volume)
-        
-        logger.info(f"📊 [{self.index_name}] Spot: {spot_price:.1f} | PCR: {pcr:.2f} | "
-                   f"ATM CE: {atm_ce_change:+.1f}% PE: {atm_pe_change:+.1f}% | "
-                   f"Vol: {vol_mult:.1f}x")
-        
-        # CE Buy Signal
-        if (ce_total_15m < -OI_THRESHOLD_MEDIUM or atm_ce_change < -ATM_OI_THRESHOLD):
-            
-            checks = {
-                "CE Unwinding": ce_total_15m < -OI_THRESHOLD_MEDIUM or atm_ce_change < -ATM_OI_THRESHOLD,
-                "Strong 5m": abs(ce_total_5m) >= 3.0,
-                "Volume Spike": has_vol_spike
-            }
-            
-            passed = sum(checks.values())
-            
-            if passed >= 1:  # At least CE unwinding
-                confidence = 70 + (passed * 5)
-                target = 60 if abs(ce_total_15m) >= OI_THRESHOLD_STRONG else 50
+            if strike_data:
+                pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
                 
-                logger.info(f"🟢 [{self.index_name}] CE SIGNAL! Conf: {confidence}%")
+                self.results['options']['status'] = 'success'
+                self.results['options']['data'] = {
+                    'strikes_found': len(strike_data),
+                    'atm_strike': atm_strike,
+                    'total_ce_oi': total_ce_oi,
+                    'total_pe_oi': total_pe_oi,
+                    'pcr': pcr,
+                    'strikes': strike_data
+                }
                 
-                return Signal(
-                    index_name=self.index_name,
-                    type="CE_BUY",
-                    reason=f"Call Unwinding (ATM: {atm_ce_change:.1f}%)",
-                    confidence=min(confidence, 95),
-                    spot_price=spot_price,
-                    strike=atm_strike,
-                    target_points=target,
-                    stop_loss_points=30,
-                    pcr=pcr,
-                    atm_ce_change=atm_ce_change,
-                    atm_pe_change=atm_pe_change,
-                    ce_total_15m=ce_total_15m,
-                    pe_total_15m=pe_total_15m,
-                    ce_total_5m=ce_total_5m,
-                    pe_total_5m=pe_total_5m,
-                    volume_surge=vol_mult,
-                    timestamp=datetime.now(IST)
-                )
-        
-        # PE Buy Signal
-        if (pe_total_15m < -OI_THRESHOLD_MEDIUM or atm_pe_change < -ATM_OI_THRESHOLD):
-            
-            checks = {
-                "PE Unwinding": pe_total_15m < -OI_THRESHOLD_MEDIUM or atm_pe_change < -ATM_OI_THRESHOLD,
-                "Strong 5m": abs(pe_total_5m) >= 3.0,
-                "Volume Spike": has_vol_spike
-            }
-            
-            passed = sum(checks.values())
-            
-            if passed >= 1:
-                confidence = 70 + (passed * 5)
-                target = 60 if abs(pe_total_15m) >= OI_THRESHOLD_STRONG else 50
+                print(f"   ✅ SUCCESS: {len(strike_data)} strikes")
+                print(f"   PCR: {pcr:.2f}")
+                print(f"   Total CE OI: {total_ce_oi:,}")
+                print(f"   Total PE OI: {total_pe_oi:,}")
                 
-                logger.info(f"🔴 [{self.index_name}] PE SIGNAL! Conf: {confidence}%")
-                
-                return Signal(
-                    index_name=self.index_name,
-                    type="PE_BUY",
-                    reason=f"Put Unwinding (ATM: {atm_pe_change:.1f}%)",
-                    confidence=min(confidence, 95),
-                    spot_price=spot_price,
-                    strike=atm_strike,
-                    target_points=target,
-                    stop_loss_points=30,
-                    pcr=pcr,
-                    atm_ce_change=atm_ce_change,
-                    atm_pe_change=atm_pe_change,
-                    ce_total_15m=ce_total_15m,
-                    pe_total_15m=pe_total_15m,
-                    ce_total_5m=ce_total_5m,
-                    pe_total_5m=pe_total_5m,
-                    volume_surge=vol_mult,
-                    timestamp=datetime.now(IST)
-                )
-        
-        return None
-
-# ==================== TELEGRAM ====================
-class TelegramAlerts:
-    """Telegram notification system"""
-    
-    def __init__(self):
-        self.bot = None
-        if TELEGRAM_AVAILABLE and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            try:
-                self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
-                logger.info("✅ Telegram Ready")
-            except:
-                logger.warning("⚠️ Telegram setup failed")
-    
-    async def send_alert(self, signal: Signal):
-        """Send signal alert"""
-        if not self.bot:
-            return
-        
-        emoji = "🟢" if signal.type == "CE_BUY" else "🔴"
-        
-        entry = signal.spot_price
-        if signal.type == "CE_BUY":
-            target = entry + signal.target_points
-            stop = entry - signal.stop_loss_points
+                # Show strike details
+                print(f"\n   Strike Details:")
+                for strike in sorted(strike_data.keys()):
+                    data = strike_data[strike]
+                    marker = "📍 ATM" if strike == atm_strike else ""
+                    print(f"   {strike}: CE={data['ce_oi']:,} PE={data['pe_oi']:,} {marker}")
+            else:
+                self.results['options']['status'] = 'failed'
+                self.results['options']['error'] = 'No strikes in range'
+                print(f"   ❌ FAILED: No strikes found")
         else:
-            target = entry - signal.target_points
-            stop = entry + signal.stop_loss_points
-        
-        mode = "🧪 ALERT ONLY" if ALERT_ONLY_MODE else "⚡ LIVE"
-        
-        msg = f"""
-{emoji} {INDICES[signal.index_name]['name']} SIGNAL
-
-{mode}
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-TRADE DETAILS
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-Signal: {signal.type}
-Entry: {entry:.1f}
-Target: {target:.1f} ({signal.target_points:+} pts)
-Stop Loss: {stop:.1f} ({signal.stop_loss_points} pts)
-Strike: {signal.strike}
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-ANALYSIS
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-{signal.reason}
-Confidence: {signal.confidence}%
-
-PCR: {signal.pcr:.2f}
-Volume: {signal.volume_surge:.1f}x
-
-ATM Changes:
-  CE: {signal.atm_ce_change:+.1f}%
-  PE: {signal.atm_pe_change:+.1f}%
-
-Total OI (15m):
-  CE: {signal.ce_total_15m:+.1f}%
-  PE: {signal.pe_total_15m:+.1f}%
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-⏰ {signal.timestamp.strftime('%I:%M %p')}
-"""
-        
-        try:
-            await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-            logger.info(f"✅ [{signal.index_name}] Alert sent!")
-        except Exception as e:
-            logger.error(f"❌ Telegram error: {e}")
+            self.results['options']['status'] = 'failed'
+            self.results['options']['error'] = result.get('error', 'Unknown error')
+            print(f"   ❌ FAILED: {result.get('error')}")
     
-    async def send_startup(self, active_indices: List[str]):
-        """Send startup notification"""
-        if not self.bot:
-            return
-        
-        now = datetime.now(IST)
-        
-        indices_info = []
-        for idx in active_indices:
-            config = INDICES[idx]
-            expiry_type = "Weekly" if config['has_weekly'] else "Monthly"
-            indices_info.append(
-                f"📊 {config['name']}\n"
-                f"   Gap: {config['strike_gap']}pts | {expiry_type}"
-            )
-        
-        msg = f"""
-🚀 MULTI-INDEX BOT V13.3
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-STATUS
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-⏰ Started: {now.strftime('%I:%M %p')}
-🔄 Mode: {'🧪 ALERT ONLY' if ALERT_ONLY_MODE else '⚡ LIVE'}
-⏱️ Scan: Every {SCAN_INTERVAL}s
-🎯 Indices: {len(active_indices)}
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-ACTIVE INDICES
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-{chr(10).join(indices_info)}
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-FEATURES
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-✅ Real-time OI tracking
-✅ ATM Battle Analysis
-✅ Volume Spike Detection
-✅ PCR Analysis
-✅ Per-index cooldown
-✅ Multi-factor scoring
-
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-🔥 Scanning all indices now!
-"""
-        
-        try:
-            await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-            logger.info("✅ Startup notification sent")
-        except Exception as e:
-            logger.error(f"❌ Startup message failed: {e}")
-
-# ==================== MAIN BOT ====================
-class MultiIndexBot:
-    """Master bot controlling all indices"""
-    
-    def __init__(self):
-        self.memory = MemorySystem()
-        self.feeds = {name: DataFeed(name) for name in ACTIVE_INDICES}
-        self.analyzers = {name: Analyzer(name, self.memory) for name in ACTIVE_INDICES}
-        self.telegram = TelegramAlerts()
-        self.last_alerts = {name: None for name in ACTIVE_INDICES}
-        self.alert_cooldown = 300  # 5 minutes per index
-    
-    def is_tradeable_time(self) -> bool:
-        """Check if it's a good time to trade"""
-        now = datetime.now(IST).time()
-        
-        if not (time(9, 15) <= now <= time(15, 30)):
-            return False
-        
-        if AVOID_OPENING[0] <= now <= AVOID_OPENING[1]:
-            return False
-        
-        if AVOID_CLOSING[0] <= now <= AVOID_CLOSING[1]:
-            return False
-        
-        return True
-    
-    async def run_cycle(self):
-        """Run one complete scan cycle"""
-        if not self.is_tradeable_time():
-            return
-        
-        logger.info(f"\n{'='*70}")
-        logger.info(f"🔍 SCAN CYCLE - {datetime.now(IST).strftime('%I:%M:%S %p')}")
-        logger.info(f"{'='*70}")
-        
-        for index_name in ACTIVE_INDICES:
-            try:
-                # Fetch data
-                feed = self.feeds[index_name]
-                spot, strikes, expiry, volume = await feed.get_market_data()
-                
-                if spot == 0 or not strikes:
-                    logger.warning(f"⏭️ [{index_name}] No data")
-                    continue
-                
-                # Analyze
-                analyzer = self.analyzers[index_name]
-                signal = analyzer.analyze(spot, strikes, volume)
-                
-                if signal:
-                    # Check cooldown
-                    last_alert = self.last_alerts[index_name]
-                    if last_alert:
-                        elapsed = (datetime.now(IST) - last_alert).seconds
-                        if elapsed < self.alert_cooldown:
-                            logger.info(f"⏳ [{index_name}] Cooldown: {self.alert_cooldown - elapsed}s")
-                            continue
-                    
-                    # Send alert
-                    logger.info(f"\n🚨 [{index_name}] SIGNAL GENERATED!")
-                    logger.info(f"   Type: {signal.type}")
-                    logger.info(f"   Entry: {signal.spot_price:.1f}")
-                    logger.info(f"   Target: {signal.target_points:+} pts")
-                    logger.info(f"   Confidence: {signal.confidence}%\n")
-                    
-                    await self.telegram.send_alert(signal)
-                    self.last_alerts[index_name] = datetime.now(IST)
-                else:
-                    logger.info(f"✋ [{index_name}] No signal")
-                
-                # Delay between indices
-                await asyncio.sleep(INDEX_SCAN_DELAY)
-                
-            except Exception as e:
-                logger.error(f"💥 [{index_name}] Error: {e}")
-                continue
-        
-        logger.info(f"{'='*70}\n")
-    
-    async def start(self):
-        """Start the bot"""
-        logger.info("=" * 70)
-        logger.info("🚀 MULTI-INDEX BOT V13.3 STARTING")
-        logger.info("=" * 70)
-        logger.info("")
-        logger.info("🔥 ACTIVE INDICES:")
-        for idx in ACTIVE_INDICES:
-            config = INDICES[idx]
-            logger.info(f"   ✅ {config['name']} (Gap: {config['strike_gap']}pts)")
-        logger.info("")
-        logger.info(f"⏱️  Scan Interval: {SCAN_INTERVAL}s")
-        logger.info(f"📊 Memory: {'Redis' if self.memory.use_redis else 'RAM'}")
-        logger.info(f"📱 Telegram: {'Enabled' if self.telegram.bot else 'Disabled'}")
-        logger.info("")
-        logger.info("=" * 70)
-        
-        # Send startup notification
-        await self.telegram.send_startup(ACTIVE_INDICES)
-        
-        # Main loop
-        while True:
-            try:
-                now = datetime.now(IST).time()
-                
-                if time(9, 15) <= now <= time(15, 30):
-                    await self.run_cycle()
-                    await asyncio.sleep(SCAN_INTERVAL)
-                else:
-                    logger.info("🌙 Market closed - Waiting...")
-                    await asyncio.sleep(300)
+    async def run_all_tests(self):
+        """Run all tests for this index"""
+        async with aiohttp.ClientSession() as session:
+            await self.test_spot_price(session)
+            await asyncio.sleep(1)  # Rate limit protection
             
-            except KeyboardInterrupt:
-                logger.info("\n🛑 Stopped by user")
-                break
+            await self.test_futures_candles(session)
+            await asyncio.sleep(1)
             
-            except Exception as e:
-                logger.error(f"💥 Critical error: {e}")
-                await asyncio.sleep(30)
+            await self.test_option_chain(session)
+    
+    def print_summary(self):
+        """Print test summary"""
+        print(f"\n{'='*60}")
+        print(f"📋 SUMMARY: {self.config['name']}")
+        print(f"{'='*60}")
+        
+        for test_name, result in self.results.items():
+            status_emoji = "✅" if result['status'] == 'success' else "❌"
+            print(f"{status_emoji} {test_name.upper()}: {result['status']}")
+            if result['error']:
+                print(f"   Error: {result['error']}")
+        
+        print(f"{'='*60}\n")
 
-# ==================== MAIN ====================
-async def main():
-    """Main entry point"""
-    bot = MultiIndexBot()
-    await bot.start()
+# ==================== MAIN TEST ====================
+async def test_all_indices():
+    """Test data fetching for all indices"""
+    
+    print("="*70)
+    print("🧪 MULTI-INDEX DATA FETCHING TEST")
+    print("="*70)
+    print(f"⏰ Started: {datetime.now(IST).strftime('%d-%b %I:%M:%S %p')}")
+    print(f"🎯 Testing {len(TEST_INDICES)} indices")
+    print("="*70)
+    
+    # Check token
+    if UPSTOX_ACCESS_TOKEN == 'YOUR_TOKEN_HERE':
+        print("\n⚠️ ERROR: Please set UPSTOX_ACCESS_TOKEN")
+        return
+    
+    all_results = {}
+    
+    for index_name in TEST_INDICES:
+        print(f"\n\n{'#'*70}")
+        print(f"🔍 TESTING: {INDICES[index_name]['name']}")
+        print(f"{'#'*70}")
+        
+        fetcher = DataFetcher(index_name)
+        await fetcher.run_all_tests()
+        await asyncio.sleep(2)  # Delay between indices
+        
+        all_results[index_name] = fetcher
+    
+    # Final Summary
+    print("\n\n" + "="*70)
+    print("📊 FINAL RESULTS")
+    print("="*70)
+    
+    for index_name, fetcher in all_results.items():
+        fetcher.print_summary()
+    
+    # Overall Status
+    print("="*70)
+    print("🎯 OVERALL STATUS")
+    print("="*70)
+    
+    for index_name, fetcher in all_results.items():
+        spot_ok = fetcher.results['spot']['status'] == 'success'
+        futures_ok = fetcher.results['futures']['status'] == 'success'
+        options_ok = fetcher.results['options']['status'] == 'success'
+        
+        all_ok = spot_ok and futures_ok and options_ok
+        status = "✅ READY" if all_ok else "⚠️ PARTIAL" if spot_ok else "❌ FAILED"
+        
+        print(f"{status} - {INDICES[index_name]['name']}")
+        if not all_ok:
+            if not spot_ok:
+                print(f"   ⚠️ Spot: {fetcher.results['spot']['error']}")
+            if not futures_ok:
+                print(f"   ⚠️ Futures: {fetcher.results['futures']['error']}")
+            if not options_ok:
+                print(f"   ⚠️ Options: {fetcher.results['options']['error']}")
+    
+    print("="*70)
+    print(f"⏰ Completed: {datetime.now(IST).strftime('%d-%b %I:%M:%S %p')}")
+    print("="*70)
 
+# ==================== RUN ====================
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(test_all_indices())
     except KeyboardInterrupt:
-        logger.info("\n👋 Shutdown complete")
+        print("\n\n👋 Test stopped by user")
+    except Exception as e:
+        print(f"\n\n💥 Critical error: {e}")
+        import traceback
+        traceback.print_exc()
