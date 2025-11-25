@@ -166,44 +166,44 @@ class FuturesDataFetcher:
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
-        self.futures_keys = {}  # Will be populated from instruments master
     
-    async def initialize(self):
-        """Fetch correct instrument keys from master"""
-        self.futures_keys = await fetch_instruments_master()
-        
-        if not self.futures_keys:
-            raise Exception("❌ Failed to fetch instruments master!")
-    
-    async def fetch_candles(self, index_name: str) -> dict:
+    async def fetch_candles(self, symbol: str, index_name: str) -> dict:
         """
         Fetch last 10 candles (1-minute interval)
         
-        Endpoint: /v2/historical-candle/{instrument_key}/1minute/{to_date}/{from_date}
+        Endpoint: /v2/historical-candle/{instrument}/1minute/{to_date}/{from_date}
         
-        Now uses CORRECT numeric instrument keys from master!
+        Returns:
+        {
+            "index": "NIFTY 50",
+            "symbol": "NSE_FO|NIFTY25NOVFUT",
+            "candles": [
+                {
+                    "timestamp": "2025-11-25T14:30:00+05:30",
+                    "open": 24500.0,
+                    "high": 24520.0,
+                    "low": 24495.0,
+                    "close": 24510.0,
+                    "volume": 125000,
+                    "oi": 5000000
+                },
+                ...
+            ],
+            "total_volume": 1250000
+        }
         """
-        if index_name not in self.futures_keys:
-            logger.error(f"❌ {index_name}: Instrument key not found")
-            return None
-        
-        instrument_info = self.futures_keys[index_name]
-        instrument_key = instrument_info['key']
-        trading_symbol = instrument_info['symbol']
-        
         async with aiohttp.ClientSession() as session:
             # Date range: last 2 days to ensure we get today's data
             to_date = datetime.now(IST).strftime('%Y-%m-%d')
             from_date = (datetime.now(IST) - timedelta(days=2)).strftime('%Y-%m-%d')
             
-            # URL encode instrument key
-            enc_key = urllib.parse.quote(instrument_key)
+            # URL encode symbol
+            enc_symbol = urllib.parse.quote(symbol)
             
-            url = f"https://api.upstox.com/v2/historical-candle/{enc_key}/1minute/{to_date}/{from_date}"
+            url = f"https://api.upstox.com/v2/historical-candle/{enc_symbol}/1minute/{to_date}/{from_date}"
             
             logger.info(f"🔍 Fetching: {index_name}")
-            logger.info(f"   Key: {instrument_key}")
-            logger.info(f"   Symbol: {trading_symbol}")
+            logger.info(f"   URL: {url}")
             
             try:
                 async with session.get(url, headers=self.headers) as resp:
@@ -242,9 +242,7 @@ class FuturesDataFetcher:
                             
                             return {
                                 "index": FUTURES_CONFIG[index_name]['name'],
-                                "instrument_key": instrument_key,
-                                "trading_symbol": trading_symbol,
-                                "expiry": instrument_info['expiry'],
+                                "symbol": symbol,
                                 "candles": parsed_candles,
                                 "total_volume": total_volume,
                                 "timestamp": datetime.now(IST).isoformat()
@@ -273,7 +271,8 @@ class FuturesDataFetcher:
         }
         
         for index_name in FUTURES_CONFIG.keys():
-            data = await self.fetch_candles(index_name)
+            symbol = get_futures_symbol(index_name)
+            data = await self.fetch_candles(symbol, index_name)
             
             if data:
                 results['indices'][index_name] = data
@@ -372,10 +371,9 @@ async def main():
     """Main testing loop"""
     
     logger.info("=" * 80)
-    logger.info("🚀 FUTURES DATA TESTING BOT - FIXED VERSION")
+    logger.info("🚀 FUTURES DATA TESTING BOT")
     logger.info("=" * 80)
     logger.info("")
-    logger.info("🔧 FIX: Using Instruments Master API")
     logger.info("📊 Testing Indices:")
     for name, config in FUTURES_CONFIG.items():
         logger.info(f"   - {config['name']}")
@@ -385,15 +383,7 @@ async def main():
     logger.info("")
     logger.info("=" * 80)
     
-    # Initialize fetcher (will load instruments master)
     fetcher = FuturesDataFetcher()
-    
-    try:
-        await fetcher.initialize()
-    except Exception as e:
-        logger.error(f"💥 Initialization failed: {e}")
-        return
-    
     sender = TelegramSender()
     
     iteration = 0
