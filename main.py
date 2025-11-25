@@ -499,21 +499,29 @@ class StrikeDataFeed:
             
             if ltp_data and ltp_data.get('status') == 'success':
                 data = ltp_data.get('data', {})
-                # Try multiple key formats
-                for key in [self.spot_symbol, enc_spot]:
-                    if key in data:
-                        spot_price = data[key].get('last_price', 0)
-                        break
                 
-                if spot_price > 0:
+                # Correct extraction - response structure is:
+                # {"data": {"NSE_INDEX|Nifty 50": {"last_price": 23900.50}}}
+                if self.spot_symbol in data:
+                    spot_data = data[self.spot_symbol]
+                    spot_price = spot_data.get('last_price', 0)
                     logger.info(f"✅ Spot: ₹{spot_price:.2f}")
                 else:
-                    logger.error(f"❌ Spot price not found in response")
-                    logger.error(f"Response keys: {list(data.keys())}")
+                    logger.error(f"❌ Spot symbol '{self.spot_symbol}' not found")
+                    logger.error(f"Available keys: {list(data.keys())}")
+                    # Try first available key as fallback
+                    if data:
+                        first_key = list(data.keys())[0]
+                        spot_data = data[first_key]
+                        spot_price = spot_data.get('last_price', 0)
+                        logger.warning(f"⚠️ Using fallback key: {first_key} = ₹{spot_price:.2f}")
             else:
-                logger.error(f"❌ LTP API failed: {ltp_data}")
+                logger.error(f"❌ LTP API failed")
+                if ltp_data:
+                    logger.error(f"Response: {json.dumps(ltp_data, indent=2)}")
             
             if spot_price == 0:
+                logger.error("❌ Cannot proceed without spot price")
                 return df, strike_data, "", 0, 0, 0
             
             # 2 SECOND DELAY
