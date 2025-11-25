@@ -651,4 +651,286 @@ class StrikeMasterBot:
         
         df, strike_data, expiry, spot, futures, vol = await self.feed.get_market_data()
         
-        if df.empty or not strike_data or spot ==
+        if df.empty or not strike_data or spot == 0: 0:
+            logger.warning("⚠️ Incomplete data - skipping cycle")
+            return
+        
+        vwap = self.analyzer.calculate_vwap(df)
+        atr = self.analyzer.calculate_atr(df)
+        pcr = self.analyzer.calculate_focused_pcr(strike_data)
+        candle_color, candle_size = self.analyzer.get_candle_info(df)
+        has_vol_spike, vol_mult = self.analyzer.check_volume_surge(vol)
+        
+        strike_gap = self.index_config['strike_gap']
+        atm_strike = round(spot / strike_gap) * strike_gap
+        atm_ce_15m, atm_pe_15m = self.analyzer.analyze_atm_battle(strike_data, atm_strike, self.redis)
+        
+        total_ce = sum(d['ce_oi'] for d in strike_data.values())
+        total_pe = sum(d['pe_oi'] for d in strike_data.values())
+        ce_total_15m, pe_total_15m = self.redis.get_total_oi_change(total_ce, total_pe, 15)
+        
+        self.redis.save_strike_snapshot(strike_data)
+        self.redis.save_total_oi_snapshot(total_ce, total_pe)
+        
+        logger.info(f"📊 Spot: ₹{spot:.2f} | Futures: ₹{futures:.2f} | PCR: {pcr:.2f}")
+        logger.info(f"📈 VWAP: ₹{vwap:.2f} | ATR: {atr:.1f} | Candle: {candle_color}")
+        logger.info(f"📉 OI 15m: CE={ce_total_15m:+.1f}% PE={pe_total_15m:+.1f}%")
+        
+        if is_tradeable_time():
+            signal = self.generate_signal(
+                spot, futures, vwap, abs(futures - vwap), pcr, atr,
+                ce_total_15m, pe_total_15m, 0, 0,
+                atm_ce_15m, atm_pe_15m,
+                candle_color, candle_size,
+                has_vol_spike, vol_mult, df
+            )
+            if signal:
+                await self.send_alert(signal)
+        else:
+            logger.info("📊 Data collected (avoid window)")
+        
+        logger.info(f"{'='*60}\n")
+    
+    def generate_signal(self, spot_price, futures_price, vwap, vwap_distance, pcr, atr,
+                       ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
+                       atm_ce_change, atm_pe_change, candle_color, candle_size,
+                       has_vol_spike, vol_mult, df) -> Optional[Signal]:
+        
+        strike_gap = self.index_config['strike_gap']
+        strike = round(spot_price / strike_gap) * strike_gap
+        stop_loss_points = int(atr * ATR_SL_MULTIPLIER)
+        target_points = int(atr * ATR_TARGET_MULTIPLIER)
+        
+        # Dynamic target adjustment based on OI strength
+        if abs(ce_total_15m) >= OI_THRESHOLD_STRONG or abs(atm_ce_change) >= OI_THRESHOLD_STRONG:
+            target_points = max(target_points, 80)
+        elif abs(ce_total_15m) >= OI_THRESHOLD_MEDIUM or abs(atm_ce_change) >= OI_THRESHOLD_MEDIUM:
+            target_points = max(target_points, 50)
+        
+        # BULLISH SIGNAL: CE Unwinding
+        if ce_total_15m < -OI_THRESHOLD_MEDIUM or atm_ce_change < -ATM_OI_THRESHOLD:
+            checks = {
+                "CE OI Unwinding": ce_total_15m < -OI_THRESHOLD_MEDIUM,
+                "ATM CE Unwinding": atm_ce_change < -ATM_OI_THRESHOLD,
+                "Price > VWAP": futures_price > vwap,
+                "GREEN Candle": candle_color == 'GREEN'
+            }
+            
+            bonus = {
+                "Big Candle": candle_size >= MIN_CANDLE_SIZE,
+                "Far from VWAP": vwap_distance >= VWAP_BUFFER,
+                "Bullish PCR": pcr > PCR_BULLISH,
+                "Volume Spike": has_vol_spike,
+                "Momentum": self.analyzer.check_momentum(df, 'bullish')
+            }
+            
+            passed = sum(checks.values())
+            bonus_passed = sum(bonus.values())
+            
+            if passed == 4:
+                confidence = 75 + (bonus_passed * 4)
+                logger.info(f"🚀 CE SIGNAL! Confidence: {confidence}%")
+                
+                return Signal(
+                    type="CE_BUY",
+                    reason=f"Call Unwinding (ATM: {atm_ce_change:.1f}%)",
+                    confidence=min(confidence, 95),
+                    spot_price=spot_price,
+                    futures_price=futures_price,
+                    strike=strike,
+                    target_points=target_points,
+                    stop_loss_points=stop_loss_points,
+                    pcr=pcr,
+                    candle_color=candle_color,
+                    volume_surge=vol_mult,
+                    oi_5m=0,
+                    oi_15m=ce_total_15m,
+                    atm_ce_change=atm_ce_change,
+                    atm_pe_change=atm_pe_change,
+                    atr=atr,
+                    timestamp=datetime.now(IST)
+                )
+        
+        # BEARISH SIGNAL: PE Unwinding
+        if pe_total_15m < -OI_THRESHOLD_MEDIUM or atm_pe_change < -ATM_OI_THRESHOLD:
+            if abs(pe_total_15m) >= OI_THRESHOLD_STRONG or abs(atm_pe_change) >= OI_THRESHOLD_STRONG:
+                target_points = max(target_points, 80)
+            
+            checks = {
+                "PE OI Unwinding": pe_total_15m < -OI_THRESHOLD_MEDIUM,
+                "ATM PE Unwinding": atm_pe_change < -ATM_OI_THRESHOLD,
+                "Price < VWAP": futures_price < vwap,
+                "RED Candle": candle_color == 'RED'
+            }
+            
+            bonus = {
+                "Big Candle": candle_size >= MIN_CANDLE_SIZE,
+                "Far from VWAP": vwap_distance >= VWAP_BUFFER,
+                "Bearish PCR": pcr < PCR_BEARISH,
+                "Volume Spike": has_vol_spike,
+                "Momentum": self.analyzer.check_momentum(df, 'bearish')
+            }
+            
+            passed = sum(checks.values())
+            bonus_passed = sum(bonus.values())
+            
+            if passed == 4:
+                confidence = 75 + (bonus_passed * 4)
+                logger.info(f"🔻 PE SIGNAL! Confidence: {confidence}%")
+                
+                return Signal(
+                    type="PE_BUY",
+                    reason=f"Put Unwinding (ATM: {atm_pe_change:.1f}%)",
+                    confidence=min(confidence, 95),
+                    spot_price=spot_price,
+                    futures_price=futures_price,
+                    strike=strike,
+                    target_points=target_points,
+                    stop_loss_points=stop_loss_points,
+                    pcr=pcr,
+                    candle_color=candle_color,
+                    volume_surge=vol_mult,
+                    oi_5m=0,
+                    oi_15m=pe_total_15m,
+                    atm_ce_change=atm_ce_change,
+                    atm_pe_change=atm_pe_change,
+                    atr=atr,
+                    timestamp=datetime.now(IST)
+                )
+        
+        return None
+    
+    async def send_alert(self, s: Signal):
+        if self.last_alert_time:
+            elapsed = (datetime.now(IST) - self.last_alert_time).seconds
+            if elapsed < self.alert_cooldown:
+                logger.info(f"⏸️ Cooldown: {self.alert_cooldown - elapsed}s remaining")
+                return
+        
+        self.last_alert_time = datetime.now(IST)
+        
+        emoji = "📞" if s.type == "CE_BUY" else "📉"
+        
+        if s.type == "CE_BUY":
+            entry = s.spot_price
+            target = entry + s.target_points
+            stop_loss = entry - s.stop_loss_points
+        else:
+            entry = s.spot_price
+            target = entry - s.target_points
+            stop_loss = entry + s.stop_loss_points
+        
+        mode = "🔔 ALERT ONLY" if ALERT_ONLY_MODE else "🟢 LIVE"
+        timestamp_str = s.timestamp.strftime('%d-%b %I:%M %p')
+        
+        msg = f"""
+{emoji} {self.index_config['name']} STRIKE MASTER V12
+{mode}
+
+📊 SIGNAL: {s.type}
+💰 Entry: ₹{entry:.1f}
+🎯 Target: ₹{target:.1f} (+{s.target_points})
+🛑 Stop Loss: ₹{stop_loss:.1f}
+⚡ Strike: {s.strike}
+
+📈 Reason: {s.reason}
+🎲 Confidence: {s.confidence}%
+📊 PCR: {s.pcr:.2f}
+🕐 Time: {timestamp_str}
+
+🔥 ATR: {s.atr:.1f} | Candle: {s.candle_color}
+"""
+        
+        logger.info(f"🚨 SIGNAL: {s.type} @ ₹{entry:.1f}")
+        
+        if self.telegram:
+            try:
+                await self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                logger.info("✅ Telegram alert sent")
+            except Exception as e:
+                logger.error(f"❌ Telegram error: {e}")
+    
+    async def send_startup_message(self):
+        now = datetime.now(IST)
+        startup_time = now.strftime('%d-%b %I:%M %p')
+        mode = "🔔 ALERT ONLY" if ALERT_ONLY_MODE else "🟢 LIVE TRADING"
+        
+        msg = f"""
+🚀 STRIKE MASTER V12 ONLINE
+
+⏰ {startup_time}
+📊 {self.index_config['name']}
+{mode}
+
+⚙️ Config:
+• Strike Gap: {self.index_config['strike_gap']}
+• Expiry: {self.index_config['expiry_type']}
+• Scan Interval: {SCAN_INTERVAL}s
+
+🔥 Features:
+✅ Intraday + Historical API
+✅ Real-time OI Analysis
+✅ Multi-factor Signals
+✅ Dynamic Targets
+
+Ready to scan! 🎯
+"""
+        
+        if self.telegram:
+            try:
+                await self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                logger.info("✅ Startup message sent")
+            except Exception as e:
+                logger.error(f"❌ Startup message error: {e}")
+
+async def main():
+    if ACTIVE_INDEX not in INDICES:
+        logger.error(f"❌ Invalid ACTIVE_INDEX: {ACTIVE_INDEX}")
+        return
+    
+    bot = StrikeMasterBot(ACTIVE_INDEX)
+    
+    logger.info("=" * 80)
+    logger.info("🚀 STRIKE MASTER V12 - PRODUCTION READY")
+    logger.info("=" * 80)
+    logger.info(f"📊 Index: {bot.index_config['name']}")
+    logger.info(f"🔔 Mode: {'ALERT ONLY' if ALERT_ONLY_MODE else 'LIVE TRADING'}")
+    logger.info(f"⏱️ Scan Interval: {SCAN_INTERVAL}s")
+    logger.info(f"🔥 Features: Intraday + Historical API | OI Analysis | Multi-Factor Signals")
+    logger.info("=" * 80)
+    logger.info("")
+    
+    await bot.send_startup_message()
+    
+    iteration = 0
+    
+    while True:
+        try:
+            now = datetime.now(IST).time()
+            
+            if time(9, 15) <= now <= time(15, 30):
+                iteration += 1
+                logger.info(f"🔄 Cycle #{iteration}")
+                
+                await bot.run_cycle()
+                await asyncio.sleep(SCAN_INTERVAL)
+            else:
+                # Market closed - wait 5 minutes
+                logger.info("😴 Market closed - waiting...")
+                await asyncio.sleep(300)
+        
+        except KeyboardInterrupt:
+            logger.info("\n🛑 Stopped by user")
+            break
+        
+        except Exception as e:
+            logger.error(f"💥 Error in main loop: {e}")
+            logger.exception("Full traceback:")
+            logger.info("⏳ Retrying in 30s...")
+            await asyncio.sleep(30)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("\n👋 Shutdown complete")
