@@ -68,59 +68,94 @@ FUTURES_CONFIG = {
     }
 }
 
-# ==================== FUTURES SYMBOL GENERATOR ====================
-def get_futures_symbol(index_name: str) -> str:
+# ==================== CORRECT APPROACH ====================
+# Upstox uses numeric tokens, NOT string-based symbols!
+# We must fetch from Instruments Master JSON
+
+INSTRUMENTS_URL = "https://api.upstox.com/v2/market-quote/instruments"
+
+async def fetch_instruments_master() -> dict:
     """
-    Generate current futures symbol with CORRECT DATE FORMAT
-    Format: NSE_FO|NIFTY25NOV25FUT (includes expiry date!)
-    
-    Based on Upstox actual format:
-    - NSE_FO = Futures & Options segment
-    - Symbol = {PREFIX}{DD}{MONTH}{YY}FUT
-    - DD = Expiry day (25, 26, 27, 28)
-    - MONTH = 3-letter month (NOV, DEC)
-    - YY = 2-digit year (25)
+    Fetch instruments master list to get correct futures keys
+    Returns: {index_name: instrument_key}
     """
-    now = datetime.now(IST)
-    year = now.year
-    month = now.month
+    headers = {
+        "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
+        "Accept": "application/json"
+    }
     
-    config = FUTURES_CONFIG[index_name]
-    expiry_day_of_week = config['expiry_day']  # 0=Mon, 1=Tue, 2=Wed
+    logger.info("📥 Fetching Instruments Master...")
     
-    # Find last occurrence of expiry day in current month
-    last_day = monthrange(year, month)[1]
-    last_date = datetime(year, month, last_day, tzinfo=IST)
-    days_back = (last_date.weekday() - expiry_day_of_week) % 7
-    expiry_date = last_date - timedelta(days=days_back)
-    
-    # If past expiry, use next month
-    if now.date() > expiry_date.date() or (
-        now.date() == expiry_date.date() and now.time().hour >= 15
-    ):
-        if month == 12:
-            year += 1
-            month = 1
-        else:
-            month += 1
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(INSTRUMENTS_URL, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    if data.get('status') == 'success' and 'data' in data:
+                        instruments = data['data']
+                        
+                        # Find current month futures for each index
+                        futures_map = {}
+                        
+                        for instrument in instruments:
+                            if instrument.get('instrument_type') != 'FUT':
+                                continue
+                            
+                            if instrument.get('segment') != 'NSE_FO':
+                                continue
+                            
+                            name = instrument.get('name', '')
+                            trading_symbol = instrument.get('trading_symbol', '')
+                            instrument_key = instrument.get('instrument_key', '')
+                            expiry = instrument.get('expiry', '')
+                            
+                            # Match our indices
+                            if name == 'NIFTY' and 'NIFTY' in trading_symbol:
+                                if 'NIFTY' not in futures_map:
+                                    futures_map['NIFTY'] = {
+                                        'key': instrument_key,
+                                        'symbol': trading_symbol,
+                                        'expiry': expiry
+                                    }
+                            
+                            elif name == 'BANKNIFTY' and 'BANKNIFTY' in trading_symbol:
+                                if 'BANKNIFTY' not in futures_map:
+                                    futures_map['BANKNIFTY'] = {
+                                        'key': instrument_key,
+                                        'symbol': trading_symbol,
+                                        'expiry': expiry
+                                    }
+                            
+                            elif name == 'FINNIFTY' and 'FINNIFTY' in trading_symbol:
+                                if 'FINNIFTY' not in futures_map:
+                                    futures_map['FINNIFTY'] = {
+                                        'key': instrument_key,
+                                        'symbol': trading_symbol,
+                                        'expiry': expiry
+                                    }
+                            
+                            elif name == 'MIDCPNIFTY' and 'MIDCPNIFTY' in trading_symbol:
+                                if 'MIDCPNIFTY' not in futures_map:
+                                    futures_map['MIDCPNIFTY'] = {
+                                        'key': instrument_key,
+                                        'symbol': trading_symbol,
+                                        'expiry': expiry
+                                    }
+                        
+                        logger.info(f"✅ Found {len(futures_map)} futures instruments")
+                        for idx, info in futures_map.items():
+                            logger.info(f"   {idx}: {info['key']} ({info['symbol']})")
+                        
+                        return futures_map
+                    
+                else:
+                    logger.error(f"❌ HTTP {resp.status}")
+                    return {}
         
-        # Recalculate for next month
-        last_day = monthrange(year, month)[1]
-        last_date = datetime(year, month, last_day, tzinfo=IST)
-        days_back = (last_date.weekday() - expiry_day_of_week) % 7
-        expiry_date = last_date - timedelta(days=days_back)
-    
-    # Format components
-    day = expiry_date.day  # Expiry day (25, 26, 27, etc.)
-    month_name = expiry_date.strftime('%b').upper()  # NOV, DEC, etc.
-    year_short = expiry_date.year % 100  # 25 for 2025
-    prefix = config['prefix']
-    
-    # 🔥 CORRECT FORMAT: PREFIX + DD + MONTH + YY + FUT
-    symbol = f"NSE_FO|{prefix}{day:02d}{month_name}{year_short:02d}FUT"
-    
-    logger.info(f"✅ {config['name']}: {symbol} (Expiry: {expiry_date.strftime('%d-%b-%Y')})")
-    return symbol
+        except Exception as e:
+            logger.error(f"💥 Error fetching instruments: {e}")
+            return {}
 
 # ==================== DATA FETCHER ====================
 class FuturesDataFetcher:
@@ -131,44 +166,44 @@ class FuturesDataFetcher:
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
+        self.futures_keys = {}  # Will be populated from instruments master
     
-    async def fetch_candles(self, symbol: str, index_name: str) -> dict:
+    async def initialize(self):
+        """Fetch correct instrument keys from master"""
+        self.futures_keys = await fetch_instruments_master()
+        
+        if not self.futures_keys:
+            raise Exception("❌ Failed to fetch instruments master!")
+    
+    async def fetch_candles(self, index_name: str) -> dict:
         """
         Fetch last 10 candles (1-minute interval)
         
-        Endpoint: /v2/historical-candle/{instrument}/1minute/{to_date}/{from_date}
+        Endpoint: /v2/historical-candle/{instrument_key}/1minute/{to_date}/{from_date}
         
-        Returns:
-        {
-            "index": "NIFTY 50",
-            "symbol": "NSE_FO|NIFTY25NOVFUT",
-            "candles": [
-                {
-                    "timestamp": "2025-11-25T14:30:00+05:30",
-                    "open": 24500.0,
-                    "high": 24520.0,
-                    "low": 24495.0,
-                    "close": 24510.0,
-                    "volume": 125000,
-                    "oi": 5000000
-                },
-                ...
-            ],
-            "total_volume": 1250000
-        }
+        Now uses CORRECT numeric instrument keys from master!
         """
+        if index_name not in self.futures_keys:
+            logger.error(f"❌ {index_name}: Instrument key not found")
+            return None
+        
+        instrument_info = self.futures_keys[index_name]
+        instrument_key = instrument_info['key']
+        trading_symbol = instrument_info['symbol']
+        
         async with aiohttp.ClientSession() as session:
             # Date range: last 2 days to ensure we get today's data
             to_date = datetime.now(IST).strftime('%Y-%m-%d')
             from_date = (datetime.now(IST) - timedelta(days=2)).strftime('%Y-%m-%d')
             
-            # URL encode symbol
-            enc_symbol = urllib.parse.quote(symbol)
+            # URL encode instrument key
+            enc_key = urllib.parse.quote(instrument_key)
             
-            url = f"https://api.upstox.com/v2/historical-candle/{enc_symbol}/1minute/{to_date}/{from_date}"
+            url = f"https://api.upstox.com/v2/historical-candle/{enc_key}/1minute/{to_date}/{from_date}"
             
             logger.info(f"🔍 Fetching: {index_name}")
-            logger.info(f"   URL: {url}")
+            logger.info(f"   Key: {instrument_key}")
+            logger.info(f"   Symbol: {trading_symbol}")
             
             try:
                 async with session.get(url, headers=self.headers) as resp:
@@ -207,7 +242,9 @@ class FuturesDataFetcher:
                             
                             return {
                                 "index": FUTURES_CONFIG[index_name]['name'],
-                                "symbol": symbol,
+                                "instrument_key": instrument_key,
+                                "trading_symbol": trading_symbol,
+                                "expiry": instrument_info['expiry'],
                                 "candles": parsed_candles,
                                 "total_volume": total_volume,
                                 "timestamp": datetime.now(IST).isoformat()
@@ -236,8 +273,7 @@ class FuturesDataFetcher:
         }
         
         for index_name in FUTURES_CONFIG.keys():
-            symbol = get_futures_symbol(index_name)
-            data = await self.fetch_candles(symbol, index_name)
+            data = await self.fetch_candles(index_name)
             
             if data:
                 results['indices'][index_name] = data
@@ -336,9 +372,10 @@ async def main():
     """Main testing loop"""
     
     logger.info("=" * 80)
-    logger.info("🚀 FUTURES DATA TESTING BOT")
+    logger.info("🚀 FUTURES DATA TESTING BOT - FIXED VERSION")
     logger.info("=" * 80)
     logger.info("")
+    logger.info("🔧 FIX: Using Instruments Master API")
     logger.info("📊 Testing Indices:")
     for name, config in FUTURES_CONFIG.items():
         logger.info(f"   - {config['name']}")
@@ -348,7 +385,15 @@ async def main():
     logger.info("")
     logger.info("=" * 80)
     
+    # Initialize fetcher (will load instruments master)
     fetcher = FuturesDataFetcher()
+    
+    try:
+        await fetcher.initialize()
+    except Exception as e:
+        logger.error(f"💥 Initialization failed: {e}")
+        return
+    
     sender = TelegramSender()
     
     iteration = 0
