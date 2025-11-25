@@ -71,43 +71,55 @@ FUTURES_CONFIG = {
 # ==================== FUTURES SYMBOL GENERATOR ====================
 def get_futures_symbol(index_name: str) -> str:
     """
-    Generate current futures symbol
-    Format: NSE_FO|NIFTY25NOVFUT
+    Generate current futures symbol with CORRECT DATE FORMAT
+    Format: NSE_FO|NIFTY25NOV25FUT (includes expiry date!)
     
-    Based on Upstox API documentation:
+    Based on Upstox actual format:
     - NSE_FO = Futures & Options segment
-    - Symbol = {PREFIX}{YY}{MONTH}FUT
+    - Symbol = {PREFIX}{DD}{MONTH}{YY}FUT
+    - DD = Expiry day (25, 26, 27, 28)
+    - MONTH = 3-letter month (NOV, DEC)
+    - YY = 2-digit year (25)
     """
     now = datetime.now(IST)
     year = now.year
     month = now.month
     
     config = FUTURES_CONFIG[index_name]
-    expiry_day = config['expiry_day']
+    expiry_day_of_week = config['expiry_day']  # 0=Mon, 1=Tue, 2=Wed
     
     # Find last occurrence of expiry day in current month
     last_day = monthrange(year, month)[1]
     last_date = datetime(year, month, last_day, tzinfo=IST)
-    days_to_expiry = (last_date.weekday() - expiry_day) % 7
-    last_expiry = last_date - timedelta(days=days_to_expiry)
+    days_back = (last_date.weekday() - expiry_day_of_week) % 7
+    expiry_date = last_date - timedelta(days=days_back)
     
     # If past expiry, use next month
-    if now.date() > last_expiry.date() or (
-        now.date() == last_expiry.date() and now.time().hour >= 15
+    if now.date() > expiry_date.date() or (
+        now.date() == expiry_date.date() and now.time().hour >= 15
     ):
         if month == 12:
             year += 1
             month = 1
         else:
             month += 1
+        
+        # Recalculate for next month
+        last_day = monthrange(year, month)[1]
+        last_date = datetime(year, month, last_day, tzinfo=IST)
+        days_back = (last_date.weekday() - expiry_day_of_week) % 7
+        expiry_date = last_date - timedelta(days=days_back)
     
-    year_short = year % 100
-    month_name = datetime(year, month, 1).strftime('%b').upper()
+    # Format components
+    day = expiry_date.day  # Expiry day (25, 26, 27, etc.)
+    month_name = expiry_date.strftime('%b').upper()  # NOV, DEC, etc.
+    year_short = expiry_date.year % 100  # 25 for 2025
     prefix = config['prefix']
     
-    symbol = f"NSE_FO|{prefix}{year_short:02d}{month_name}FUT"
+    # 🔥 CORRECT FORMAT: PREFIX + DD + MONTH + YY + FUT
+    symbol = f"NSE_FO|{prefix}{day:02d}{month_name}{year_short:02d}FUT"
     
-    logger.info(f"✅ {config['name']}: {symbol}")
+    logger.info(f"✅ {config['name']}: {symbol} (Expiry: {expiry_date.strftime('%d-%b-%Y')})")
     return symbol
 
 # ==================== DATA FETCHER ====================
