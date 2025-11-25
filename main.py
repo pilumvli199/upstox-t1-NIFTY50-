@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-FUTURES DATA BOT - FULLY WORKING VERSION
-=========================================
-Uses Upstox JSON instruments file to get correct keys
+FUTURES DATA BOT - INTRADAY API VERSION
+========================================
+Uses Upstox INTRADAY API for live today's data
 Fetches last 10 candles for 4 indices
 Sends to Telegram every 60 seconds
 """
@@ -54,59 +54,32 @@ class InstrumentsFetcher:
         self.futures_map = {}
     
     async def download_instruments(self):
-        """
-        Download Upstox instruments JSON file
-        File is gzipped, needs decompression
-        """
+        """Download Upstox instruments JSON file (gzipped)"""
         logger.info("📥 Downloading Upstox instruments...")
         
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(INSTRUMENTS_JSON_URL) as resp:
                     if resp.status == 200:
-                        # Read gzipped content
                         compressed = await resp.read()
-                        
-                        # Decompress
                         decompressed = gzip.decompress(compressed)
-                        
-                        # Parse JSON
                         self.instruments = json.loads(decompressed)
-                        
                         logger.info(f"✅ Loaded {len(self.instruments)} instruments")
                         return True
                     else:
                         logger.error(f"❌ HTTP {resp.status}")
                         return False
-            
             except Exception as e:
                 logger.error(f"💥 Download failed: {e}")
                 return False
     
     def find_current_month_futures(self):
-        """
-        Find current month futures for our indices
-        
-        Format in JSON:
-        {
-            "instrument_key": "NSE_FO|36702",
-            "exchange_token": "36702",
-            "trading_symbol": "NIFTY 28 NOV 24 FUT",
-            "name": "NIFTY",
-            "segment": "NSE_FO",
-            "instrument_type": "FUT",
-            "expiry": 1732723199000,
-            ...
-        }
-        """
+        """Find current month futures for our indices"""
         logger.info("🔍 Finding current month futures...")
         
         now = datetime.now(IST)
-        current_month = now.month
-        current_year = now.year
         
         for instrument in self.instruments:
-            # Filter: NSE_FO + FUT only
             if instrument.get('segment') != 'NSE_FO':
                 continue
             
@@ -115,24 +88,18 @@ class InstrumentsFetcher:
             
             name = instrument.get('name', '')
             
-            # Check if it's one of our indices
             if name not in INDEX_NAMES:
                 continue
             
-            # Get expiry timestamp (milliseconds)
             expiry_ms = instrument.get('expiry', 0)
             if not expiry_ms:
                 continue
             
-            # Convert to datetime
             expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=IST)
             
-            # Check if expiry is in current or next month
-            # (we want nearest expiry)
             if expiry_dt < now:
-                continue  # Already expired
+                continue
             
-            # If we don't have this index yet, or this expiry is earlier
             if name not in self.futures_map:
                 self.futures_map[name] = {
                     'instrument_key': instrument.get('instrument_key'),
@@ -142,7 +109,6 @@ class InstrumentsFetcher:
                     'expiry_timestamp': expiry_ms
                 }
             else:
-                # Replace if this expiry is earlier (nearest expiry)
                 if expiry_ms < self.futures_map[name]['expiry_timestamp']:
                     self.futures_map[name] = {
                         'instrument_key': instrument.get('instrument_key'),
@@ -152,7 +118,6 @@ class InstrumentsFetcher:
                         'expiry_timestamp': expiry_ms
                     }
         
-        # Log results
         logger.info(f"✅ Found {len(self.futures_map)} futures:")
         for name, info in self.futures_map.items():
             logger.info(f"   {name}: {info['instrument_key']}")
@@ -169,9 +134,9 @@ class InstrumentsFetcher:
         
         return self.find_current_month_futures()
 
-# ==================== DATA FETCHER ====================
+# ==================== DATA FETCHER (INTRADAY API) ====================
 class FuturesDataFetcher:
-    """Fetch historical candles from Upstox"""
+    """Fetch historical candles using INTRADAY API for live data"""
     
     def __init__(self, instruments_map):
         self.headers = {
@@ -182,10 +147,10 @@ class FuturesDataFetcher:
     
     async def fetch_candles(self, index_name: str) -> dict:
         """
-        Fetch last 10 candles (1-minute interval)
+        Fetch last 10 candles using INTRADAY API
         
-        Upstox API:
-        GET /v2/historical-candle/{instrument_key}/1minute/{to_date}/{from_date}
+        🔥 KEY CHANGE: Using /v2/historical-candle/intraday/{key}/1minute
+        This returns ONLY TODAY'S candles - perfect for live data!
         
         Response: [timestamp, open, high, low, close, volume, oi]
         """
@@ -205,22 +170,19 @@ class FuturesDataFetcher:
         is_weekday = now.weekday() < 5  # Mon-Fri
         
         async with aiohttp.ClientSession() as session:
-            # Date range: last 3 days (to ensure we get data)
-            to_date = datetime.now(IST).strftime('%Y-%m-%d')
-            from_date = (datetime.now(IST) - timedelta(days=3)).strftime('%Y-%m-%d')
-            
-            # URL encode key
+            # URL encode instrument key
             enc_key = urllib.parse.quote(instrument_key)
             
-            url = f"https://api.upstox.com/v2/historical-candle/{enc_key}/1minute/{to_date}/{from_date}"
+            # 🔥 INTRADAY API - Returns ONLY today's candles!
+            url = f"https://api.upstox.com/v2/historical-candle/intraday/{enc_key}/1minute"
             
             logger.info(f"🔍 {index_name}: {instrument_key}")
             
             # Market status
             if is_market_hours and is_weekday:
-                logger.info(f"   📊 Market: OPEN (Live data expected)")
+                logger.info(f"   📊 Market: OPEN (Live data)")
             else:
-                logger.info(f"   ⏸️ Market: CLOSED (Showing last available data)")
+                logger.info(f"   ⏸️ Market: CLOSED")
             
             try:
                 async with session.get(url, headers=self.headers) as resp:
@@ -231,7 +193,7 @@ class FuturesDataFetcher:
                             raw_candles = data['data'].get('candles', [])
                             
                             if not raw_candles:
-                                logger.warning(f"⚠️ {index_name}: No candles")
+                                logger.warning(f"⚠️ {index_name}: No candles (market not started?)")
                                 return None
                             
                             # Last 10 candles
@@ -241,17 +203,9 @@ class FuturesDataFetcher:
                             parsed = []
                             total_vol = 0
                             
-                            # Check if we have today's data
                             today_str = now.strftime('%Y-%m-%d')
-                            has_today_data = False
                             
                             for c in last_10:
-                                # Parse timestamp
-                                candle_time = datetime.fromisoformat(c[0])
-                                
-                                if candle_time.strftime('%Y-%m-%d') == today_str:
-                                    has_today_data = True
-                                
                                 candle = {
                                     "timestamp": c[0],
                                     "open": float(c[1]),
@@ -264,12 +218,14 @@ class FuturesDataFetcher:
                                 parsed.append(candle)
                                 total_vol += candle['volume']
                             
-                            # Status message
-                            if has_today_data:
-                                logger.info(f"✅ {index_name}: {len(parsed)} candles | Vol: {total_vol:,} | TODAY'S DATA ✓")
+                            # Check data freshness
+                            latest_time = datetime.fromisoformat(parsed[0]['timestamp'])
+                            data_age_minutes = (now - latest_time).total_seconds() / 60
+                            
+                            if data_age_minutes < 5:
+                                logger.info(f"🟢 {index_name}: {len(parsed)} candles | Vol: {total_vol:,} | LIVE DATA ({data_age_minutes:.1f}m old)")
                             else:
-                                latest_time = datetime.fromisoformat(parsed[0]['timestamp'])
-                                logger.info(f"⚠️ {index_name}: {len(parsed)} candles | Vol: {total_vol:,} | Last: {latest_time.strftime('%d-%b %I:%M %p')}")
+                                logger.info(f"🟡 {index_name}: {len(parsed)} candles | Vol: {total_vol:,} | {data_age_minutes:.0f}m old")
                             
                             return {
                                 "index": index_name,
@@ -278,7 +234,8 @@ class FuturesDataFetcher:
                                 "expiry": info['expiry'],
                                 "candles": parsed,
                                 "total_volume": total_vol,
-                                "has_today_data": has_today_data,
+                                "data_age_minutes": round(data_age_minutes, 1),
+                                "is_live": data_age_minutes < 5,
                                 "market_status": "OPEN" if (is_market_hours and is_weekday) else "CLOSED",
                                 "timestamp": datetime.now(IST).isoformat()
                             }
@@ -336,15 +293,15 @@ class TelegramSender:
     async def send_data(self, data: dict):
         """Send summary + JSON file"""
         
-        # Check if any index has today's data
+        # Check if any index has live data
         has_live_data = any(
-            idx.get('has_today_data', False) 
+            idx.get('is_live', False) 
             for idx in data['indices'].values() 
             if 'error' not in idx
         )
         
-        market_emoji = "🟢" if has_live_data else "🔴"
-        status_text = "LIVE DATA" if has_live_data else "LAST AVAILABLE DATA"
+        market_emoji = "🟢" if has_live_data else "🟡"
+        status_text = "LIVE DATA" if has_live_data else "DELAYED DATA"
         
         summary = f"""
 {market_emoji} FUTURES DATA - {status_text}
@@ -364,33 +321,40 @@ class TelegramSender:
                     latest = candles[0]
                     latest_time = datetime.fromisoformat(latest['timestamp'])
                     
-                    # Data age indicator
-                    data_emoji = "🟢" if idx_data.get('has_today_data', False) else "🟡"
+                    # Data freshness indicator
+                    is_live = idx_data.get('is_live', False)
+                    data_age = idx_data.get('data_age_minutes', 0)
+                    
+                    if is_live:
+                        freshness = f"🟢 Live ({data_age:.1f}m)"
+                    elif data_age < 60:
+                        freshness = f"🟡 {data_age:.0f}m ago"
+                    else:
+                        freshness = f"🔴 {data_age/60:.1f}h ago"
                     
                     summary += f"""
-{data_emoji} {idx_name}
+📈 {idx_name}
    Symbol: {idx_data['trading_symbol']}
    Expiry: {idx_data['expiry']}
+   Status: {freshness}
    Market: {idx_data.get('market_status', 'UNKNOWN')}
    Candles: {len(candles)}
    Volume: {idx_data['total_volume']:,}
    Latest: ₹{latest['close']:.2f}
-   Time: {latest_time.strftime('%d-%b %I:%M %p')}
+   Time: {latest_time.strftime('%I:%M %p')}
 
 """
             else:
                 summary += f"""
 ❌ {idx_name}
-   Status: Failed
+   Status: Failed to fetch
 
 """
         
         summary += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         
         if not has_live_data:
-            summary += "⚠️ Market closed - showing last available data\n"
-            summary += "   Live data available during market hours:\n"
-            summary += "   Mon-Fri, 9:15 AM - 3:30 PM IST\n\n"
+            summary += "ℹ️ Market hours: Mon-Fri, 9:15 AM - 3:30 PM IST\n\n"
         
         summary += "📎 JSON attached"
         
@@ -402,8 +366,6 @@ class TelegramSender:
             )
             
             # Send JSON
-            from io import BytesIO
-            
             json_str = json.dumps(data, indent=2)
             json_file = BytesIO(json_str.encode('utf-8'))
             json_file.name = f"futures_{datetime.now(IST).strftime('%H%M%S')}.json"
@@ -424,8 +386,10 @@ async def main():
     """Main loop"""
     
     logger.info("=" * 80)
-    logger.info("🚀 FUTURES DATA BOT - JSON VERSION")
+    logger.info("🚀 FUTURES DATA BOT - INTRADAY API VERSION")
     logger.info("=" * 80)
+    logger.info("")
+    logger.info("🔥 Using INTRADAY API for live today's data!")
     logger.info("")
     
     # Initialize instruments
@@ -435,7 +399,6 @@ async def main():
     success = await instruments_fetcher.initialize()
     if not success:
         logger.error("❌ Failed to load instruments!")
-        logger.error("   Check internet connection")
         return
     
     if len(instruments_fetcher.futures_map) == 0:
