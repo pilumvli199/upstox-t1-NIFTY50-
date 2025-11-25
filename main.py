@@ -1,32 +1,118 @@
 #!/usr/bin/env python3
 """
-FUTURES SYMBOL FORMAT TESTER
-=============================
-Test different symbol formats to find working one
+FUTURES DATA TESTING BOT
+========================
+Testing Upstox Futures Historical Candles API
 
-We'll test:
-- NIFTY24NOVFUT vs NIFTY24NOV vs NIFTY24NOV25FUT
-- Different month variations
-- Different year formats
+Fetches last 10 candles (1-minute) for 4 indices:
+- NIFTY 50
+- BANK NIFTY
+- FIN NIFTY
+- MIDCAP NIFTY
 
-Author: Symbol Tester
-Date: November 24, 2025
+Sends JSON data to Telegram every 1 minute
 """
 
+import os
 import asyncio
 import aiohttp
-import os
+import urllib.parse
 from datetime import datetime, timedelta
-from calendar import monthrange
 import pytz
+import json
+import logging
+from calendar import monthrange
 
-# ==================== CONFIGURATION ====================
+try:
+    from telegram import Bot
+    TELEGRAM_AVAILABLE = True
+except ImportError:
+    TELEGRAM_AVAILABLE = False
+    print("⚠️ Install: pip install python-telegram-bot")
+    exit(1)
+
+# ==================== CONFIG ====================
 IST = pytz.timezone('Asia/Kolkata')
-UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', '')
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger("FuturesTester")
 
-# ==================== SYMBOL GENERATOR ====================
-class SymbolTester:
-    """Test different futures symbol formats"""
+# API Credentials
+UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', 'YOUR_TOKEN_HERE')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+
+# Futures Symbols Config
+FUTURES_CONFIG = {
+    'NIFTY': {
+        'name': 'NIFTY 50',
+        'prefix': 'NIFTY',
+        'expiry_day': 1  # Tuesday
+    },
+    'BANKNIFTY': {
+        'name': 'BANK NIFTY',
+        'prefix': 'BANKNIFTY',
+        'expiry_day': 2  # Wednesday
+    },
+    'FINNIFTY': {
+        'name': 'FIN NIFTY',
+        'prefix': 'FINNIFTY',
+        'expiry_day': 1  # Tuesday
+    },
+    'MIDCPNIFTY': {
+        'name': 'MIDCAP NIFTY',
+        'prefix': 'MIDCPNIFTY',
+        'expiry_day': 0  # Monday
+    }
+}
+
+# ==================== FUTURES SYMBOL GENERATOR ====================
+def get_futures_symbol(index_name: str) -> str:
+    """
+    Generate current futures symbol
+    Format: NSE_FO|NIFTY25NOVFUT
+    
+    Based on Upstox API documentation:
+    - NSE_FO = Futures & Options segment
+    - Symbol = {PREFIX}{YY}{MONTH}FUT
+    """
+    now = datetime.now(IST)
+    year = now.year
+    month = now.month
+    
+    config = FUTURES_CONFIG[index_name]
+    expiry_day = config['expiry_day']
+    
+    # Find last occurrence of expiry day in current month
+    last_day = monthrange(year, month)[1]
+    last_date = datetime(year, month, last_day, tzinfo=IST)
+    days_to_expiry = (last_date.weekday() - expiry_day) % 7
+    last_expiry = last_date - timedelta(days=days_to_expiry)
+    
+    # If past expiry, use next month
+    if now.date() > last_expiry.date() or (
+        now.date() == last_expiry.date() and now.time().hour >= 15
+    ):
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+    
+    year_short = year % 100
+    month_name = datetime(year, month, 1).strftime('%b').upper()
+    prefix = config['prefix']
+    
+    symbol = f"NSE_FO|{prefix}{year_short:02d}{month_name}FUT"
+    
+    logger.info(f"✅ {config['name']}: {symbol}")
+    return symbol
+
+# ==================== DATA FETCHER ====================
+class FuturesDataFetcher:
+    """Fetch historical candles for futures"""
     
     def __init__(self):
         self.headers = {
@@ -34,224 +120,255 @@ class SymbolTester:
             "Accept": "application/json"
         }
     
-    def generate_symbol_variations(self, index_prefix: str):
+    async def fetch_candles(self, symbol: str, index_name: str) -> dict:
         """
-        Generate all possible symbol variations for testing
+        Fetch last 10 candles (1-minute interval)
         
-        Patterns to test:
-        1. NIFTY24NOVFUT
-        2. NIFTY24NOV25FUT
-        3. NIFTY24NOV
-        4. NIFTYNOV24FUT
-        5. NIFTY2024NOVFUT
+        Endpoint: /v2/historical-candle/{instrument}/1minute/{to_date}/{from_date}
+        
+        Returns:
+        {
+            "index": "NIFTY 50",
+            "symbol": "NSE_FO|NIFTY25NOVFUT",
+            "candles": [
+                {
+                    "timestamp": "2025-11-25T14:30:00+05:30",
+                    "open": 24500.0,
+                    "high": 24520.0,
+                    "low": 24495.0,
+                    "close": 24510.0,
+                    "volume": 125000,
+                    "oi": 5000000
+                },
+                ...
+            ],
+            "total_volume": 1250000
+        }
         """
-        now = datetime.now(IST)
-        
-        # Current month
-        current_month = now.strftime('%b').upper()  # NOV
-        current_year_2digit = now.year % 100  # 24 (for 2024) or 25 (for 2025)
-        current_year_4digit = now.year  # 2025
-        
-        # Next month
-        next_month_date = now + timedelta(days=32)
-        next_month = next_month_date.strftime('%b').upper()  # DEC
-        next_month_year_2digit = next_month_date.year % 100
-        
-        # Previous month
-        prev_month_date = now - timedelta(days=32)
-        prev_month = prev_month_date.strftime('%b').upper()  # OCT
-        
-        # Contract year (April-March cycle)
-        contract_year = current_year_2digit
-        if now.month <= 3:  # Jan, Feb, Mar
-            contract_year = current_year_2digit - 1
-        
-        variations = []
-        
-        # Pattern 1: NIFTY24NOVFUT (Contract year + Month + FUT)
-        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{current_month}FUT")
-        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{next_month}FUT")
-        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{prev_month}FUT")
-        
-        # Pattern 2: NIFTY24NOV25FUT (Contract year + Month + Expiry year + FUT)
-        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{current_month}{current_year_2digit:02d}FUT")
-        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{next_month}{next_month_year_2digit:02d}FUT")
-        
-        # Pattern 3: NIFTY24NOV (No FUT suffix)
-        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{current_month}")
-        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{next_month}")
-        
-        # Pattern 4: NIFTYNOV24FUT (Month + Year + FUT)
-        variations.append(f"NSE_FO|{index_prefix}{current_month}{current_year_2digit:02d}FUT")
-        variations.append(f"NSE_FO|{index_prefix}{next_month}{next_month_year_2digit:02d}FUT")
-        
-        # Pattern 5: NIFTY2024NOVFUT (Full year)
-        variations.append(f"NSE_FO|{index_prefix}{current_year_4digit}{current_month}FUT")
-        
-        # Pattern 6: Current year instead of contract year
-        variations.append(f"NSE_FO|{index_prefix}{current_year_2digit:02d}{current_month}FUT")
-        variations.append(f"NSE_FO|{index_prefix}{current_year_2digit:02d}{next_month}FUT")
-        
-        return variations
-    
-    async def test_symbol(self, symbol: str, session: aiohttp.ClientSession):
-        """Test if a symbol works by fetching LTP"""
-        
-        symbol_encoded = symbol.replace('|', '%7C')
-        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={symbol_encoded}"
-        
-        try:
-            async with session.get(url, headers=self.headers,
-                                 timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                
-                if resp.status == 200:
-                    data = await resp.json()
-                    
-                    # Check if data exists
-                    if 'data' in data and symbol in data['data']:
-                        ltp = data['data'][symbol].get('last_price', 0)
-                        if ltp > 0:
-                            return True, ltp, None
-                    
-                    return False, 0, "No price data"
-                
-                elif resp.status == 404:
-                    return False, 0, "Symbol not found (404)"
-                
-                elif resp.status == 400:
-                    return False, 0, "Invalid format (400)"
-                
-                else:
-                    error = await resp.text()
-                    return False, 0, f"HTTP {resp.status}"
-        
-        except asyncio.TimeoutError:
-            return False, 0, "Timeout"
-        
-        except Exception as e:
-            return False, 0, str(e)
-    
-    async def find_working_symbol(self, index_name: str, index_prefix: str):
-        """Find working symbol for an index"""
-        
-        print(f"\n{'='*70}")
-        print(f"🔍 TESTING: {index_name}")
-        print(f"{'='*70}")
-        
-        variations = self.generate_symbol_variations(index_prefix)
-        
-        print(f"\n📋 Generated {len(variations)} symbol variations to test")
-        print(f"⏳ Testing each variation...\n")
-        
         async with aiohttp.ClientSession() as session:
+            # Date range: last 2 days to ensure we get today's data
+            to_date = datetime.now(IST).strftime('%Y-%m-%d')
+            from_date = (datetime.now(IST) - timedelta(days=2)).strftime('%Y-%m-%d')
             
-            working_symbols = []
+            # URL encode symbol
+            enc_symbol = urllib.parse.quote(symbol)
             
-            for i, symbol in enumerate(variations, 1):
-                print(f"{i:2d}. Testing: {symbol:<55}", end=" ")
-                
-                success, ltp, error = await self.test_symbol(symbol, session)
-                
-                if success:
-                    print(f"✅ WORKS! Price: ₹{ltp}")
-                    working_symbols.append({
-                        'symbol': symbol,
-                        'ltp': ltp
-                    })
-                else:
-                    print(f"❌ {error}")
-                
-                # Small delay to avoid rate limits
-                await asyncio.sleep(0.5)
+            url = f"https://api.upstox.com/v2/historical-candle/{enc_symbol}/1minute/{to_date}/{from_date}"
             
-            print(f"\n{'='*70}")
+            logger.info(f"🔍 Fetching: {index_name}")
+            logger.info(f"   URL: {url}")
             
-            if working_symbols:
-                print(f"✅ FOUND {len(working_symbols)} WORKING SYMBOL(S):\n")
-                for item in working_symbols:
-                    print(f"   💡 {item['symbol']}")
-                    print(f"      Last Price: ₹{item['ltp']}")
-                    print()
-            else:
-                print(f"❌ NO WORKING SYMBOLS FOUND")
+            try:
+                async with session.get(url, headers=self.headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        
+                        if data.get('status') == 'success' and 'data' in data:
+                            raw_candles = data['data'].get('candles', [])
+                            
+                            if not raw_candles:
+                                logger.warning(f"⚠️ {index_name}: No candles received")
+                                return None
+                            
+                            # Get last 10 candles (most recent first in response)
+                            last_10 = raw_candles[:10]
+                            
+                            # Parse candles
+                            parsed_candles = []
+                            total_volume = 0
+                            
+                            for candle in last_10:
+                                # Upstox format: [timestamp, open, high, low, close, volume, oi]
+                                parsed = {
+                                    "timestamp": candle[0],
+                                    "open": float(candle[1]),
+                                    "high": float(candle[2]),
+                                    "low": float(candle[3]),
+                                    "close": float(candle[4]),
+                                    "volume": int(candle[5]),
+                                    "oi": int(candle[6]) if len(candle) > 6 else 0
+                                }
+                                parsed_candles.append(parsed)
+                                total_volume += parsed['volume']
+                            
+                            logger.info(f"✅ {index_name}: {len(parsed_candles)} candles | Vol: {total_volume:,}")
+                            
+                            return {
+                                "index": FUTURES_CONFIG[index_name]['name'],
+                                "symbol": symbol,
+                                "candles": parsed_candles,
+                                "total_volume": total_volume,
+                                "timestamp": datetime.now(IST).isoformat()
+                            }
+                        else:
+                            logger.error(f"❌ {index_name}: Invalid response - {data}")
+                            return None
+                    
+                    elif resp.status == 429:
+                        logger.warning(f"⏳ Rate limited")
+                        return None
+                    else:
+                        error_text = await resp.text()
+                        logger.error(f"❌ {index_name}: HTTP {resp.status} - {error_text}")
+                        return None
             
-            print(f"{'='*70}")
-            
-            return working_symbols
+            except Exception as e:
+                logger.error(f"💥 {index_name}: {e}")
+                return None
     
-    async def test_all_indices(self):
-        """Test all indices"""
-        
-        indices = {
-            'NIFTY': 'NIFTY',
-            'BANKNIFTY': 'BANKNIFTY',
-            'FINNIFTY': 'FINNIFTY',
-            'MIDCPNIFTY': 'MIDCPNIFTY'
+    async def fetch_all_indices(self) -> dict:
+        """Fetch data for all 4 indices"""
+        results = {
+            "fetch_time": datetime.now(IST).strftime('%d-%b-%Y %I:%M:%S %p'),
+            "indices": {}
         }
         
-        print("="*70)
-        print("🧪 FUTURES SYMBOL FORMAT TESTER")
-        print("="*70)
-        print(f"⏰ Time: {datetime.now(IST).strftime('%d-%b %I:%M:%S %p')}")
-        print(f"🎯 Testing: {len(indices)} indices")
-        print("="*70)
-        
-        if not UPSTOX_ACCESS_TOKEN:
-            print("\n❌ ERROR: UPSTOX_ACCESS_TOKEN not set!")
-            return
-        
-        print(f"\n✅ Token: {UPSTOX_ACCESS_TOKEN[:20]}...")
-        
-        all_results = {}
-        
-        for index_name, index_prefix in indices.items():
-            results = await self.find_working_symbol(index_name, index_prefix)
-            all_results[index_name] = results
-            await asyncio.sleep(2)  # Delay between indices
-        
-        # Final Summary
-        print("\n\n" + "="*70)
-        print("📊 FINAL RESULTS")
-        print("="*70)
-        
-        for index_name, results in all_results.items():
-            if results:
-                print(f"\n✅ {index_name}:")
-                for item in results:
-                    print(f"   {item['symbol']}")
+        for index_name in FUTURES_CONFIG.keys():
+            symbol = get_futures_symbol(index_name)
+            data = await self.fetch_candles(symbol, index_name)
+            
+            if data:
+                results['indices'][index_name] = data
             else:
-                print(f"\n❌ {index_name}: No working symbols found")
+                results['indices'][index_name] = {
+                    "error": "Failed to fetch data"
+                }
+            
+            # Small delay to avoid rate limiting
+            await asyncio.sleep(0.5)
         
-        print("\n" + "="*70)
-        print("🎯 SUMMARY")
-        print("="*70)
+        return results
+
+# ==================== TELEGRAM SENDER ====================
+class TelegramSender:
+    """Send JSON data to Telegram"""
+    
+    def __init__(self):
+        if not TELEGRAM_AVAILABLE:
+            raise Exception("Telegram library not available")
         
-        total_found = sum(len(r) for r in all_results.values())
+        self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    
+    async def send_json(self, data: dict):
+        """Send data as formatted JSON message"""
         
-        if total_found > 0:
-            print(f"\n✅ Found {total_found} working symbols!")
-            print("\n💡 Copy the working symbols and update your data fetching code")
-        else:
-            print("\n❌ No working symbols found")
-            print("\n💡 Possible issues:")
-            print("   1. Token expired/invalid")
-            print("   2. Market closed (but LTP should still work)")
-            print("   3. Upstox API format changed")
+        # Create summary message
+        summary = f"""
+🔥 FUTURES DATA TEST
+
+⏰ {data['fetch_time']}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+📊 DATA SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━
+"""
         
-        print("="*70)
+        for index_name, index_data in data['indices'].items():
+            if 'error' not in index_data:
+                config = FUTURES_CONFIG[index_name]
+                candle_count = len(index_data.get('candles', []))
+                total_vol = index_data.get('total_volume', 0)
+                
+                # Latest candle
+                if index_data.get('candles'):
+                    latest = index_data['candles'][0]
+                    summary += f"""
+📈 {config['name']}
+   Symbol: {index_data['symbol']}
+   Candles: {candle_count}
+   Volume: {total_vol:,}
+   Latest: {latest['close']:.2f}
+   Time: {latest['timestamp'][-14:-9]}
+
+"""
+            else:
+                summary += f"""
+❌ {FUTURES_CONFIG[index_name]['name']}
+   Error: Failed to fetch
+
+"""
+        
+        summary += """━━━━━━━━━━━━━━━━━━━━━━━━
+
+📎 Full JSON data below ⬇️
+"""
+        
+        try:
+            # Send summary
+            await self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=summary
+            )
+            
+            # Send full JSON as document
+            json_str = json.dumps(data, indent=2)
+            json_bytes = json_str.encode('utf-8')
+            
+            from io import BytesIO
+            json_file = BytesIO(json_bytes)
+            json_file.name = f"futures_data_{datetime.now(IST).strftime('%H%M%S')}.json"
+            
+            await self.bot.send_document(
+                chat_id=TELEGRAM_CHAT_ID,
+                document=json_file,
+                caption="📊 Full JSON Data"
+            )
+            
+            logger.info("✅ Sent to Telegram")
+        
+        except Exception as e:
+            logger.error(f"❌ Telegram error: {e}")
 
 # ==================== MAIN ====================
 async def main():
-    """Main entry point"""
-    tester = SymbolTester()
-    await tester.test_all_indices()
+    """Main testing loop"""
+    
+    logger.info("=" * 80)
+    logger.info("🚀 FUTURES DATA TESTING BOT")
+    logger.info("=" * 80)
+    logger.info("")
+    logger.info("📊 Testing Indices:")
+    for name, config in FUTURES_CONFIG.items():
+        logger.info(f"   - {config['name']}")
+    logger.info("")
+    logger.info("⏱️ Interval: Every 60 seconds")
+    logger.info("📦 Data: Last 10 candles (1-minute)")
+    logger.info("")
+    logger.info("=" * 80)
+    
+    fetcher = FuturesDataFetcher()
+    sender = TelegramSender()
+    
+    iteration = 0
+    
+    while True:
+        try:
+            iteration += 1
+            logger.info(f"\n{'='*80}")
+            logger.info(f"🔄 Iteration #{iteration}")
+            logger.info(f"{'='*80}")
+            
+            # Fetch data
+            data = await fetcher.fetch_all_indices()
+            
+            # Send to Telegram
+            await sender.send_json(data)
+            
+            # Wait 60 seconds
+            logger.info("\n⏳ Waiting 60 seconds...\n")
+            await asyncio.sleep(60)
+        
+        except KeyboardInterrupt:
+            logger.info("\n🛑 Stopped by user")
+            break
+        
+        except Exception as e:
+            logger.error(f"💥 Error: {e}")
+            logger.info("   Retrying in 60 seconds...")
+            await asyncio.sleep(60)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n👋 Testing stopped")
-    except Exception as e:
-        print(f"\n\n💥 Error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.info("\n👋 Shutdown complete")
