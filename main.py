@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-FUTURES DATA BOT - WORKING VERSION
-===================================
-Fetches last 10 candles for 4 indices from Upstox
+FUTURES DATA BOT - FULLY WORKING VERSION
+=========================================
+Uses Upstox JSON instruments file to get correct keys
+Fetches last 10 candles for 4 indices
 Sends to Telegram every 60 seconds
-
-FIXED: Using hardcoded current month symbols
 """
 
 import os
@@ -16,6 +15,8 @@ from datetime import datetime, timedelta
 import pytz
 import json
 import logging
+import gzip
+from io import BytesIO
 
 try:
     from telegram import Bot
@@ -38,42 +39,146 @@ UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', 'YOUR_TOKEN_HERE')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
-# ==================== FUTURES SYMBOLS ====================
-# 🔥 HARDCODED SYMBOLS (November 2025)
-# तुला हे manually update करावे लागतील दर महिन्याला!
+# Upstox Instruments JSON URL
+INSTRUMENTS_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
-FUTURES_SYMBOLS = {
-    'NIFTY': {
-        'name': 'NIFTY 50',
-        'symbol': 'NSE_FO|NIFTY28NOV24FUT',  # Last Thursday
-        'expiry': '28-Nov-2024'
-    },
-    'BANKNIFTY': {
-        'name': 'BANK NIFTY',
-        'symbol': 'NSE_FO|BANKNIFTY27NOV24FUT',  # Last Wednesday
-        'expiry': '27-Nov-2024'
-    },
-    'FINNIFTY': {
-        'name': 'FIN NIFTY',
-        'symbol': 'NSE_FO|FINNIFTY26NOV24FUT',  # Last Tuesday
-        'expiry': '26-Nov-2024'
-    },
-    'MIDCPNIFTY': {
-        'name': 'MIDCAP NIFTY',
-        'symbol': 'NSE_FO|MIDCPNIFTY25NOV24FUT',  # Last Monday
-        'expiry': '25-Nov-2024'
-    }
-}
+# Index names to search
+INDEX_NAMES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
+
+# ==================== INSTRUMENTS FETCHER ====================
+class InstrumentsFetcher:
+    """Download and parse Upstox instruments JSON"""
+    
+    def __init__(self):
+        self.instruments = []
+        self.futures_map = {}
+    
+    async def download_instruments(self):
+        """
+        Download Upstox instruments JSON file
+        File is gzipped, needs decompression
+        """
+        logger.info("📥 Downloading Upstox instruments...")
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(INSTRUMENTS_JSON_URL) as resp:
+                    if resp.status == 200:
+                        # Read gzipped content
+                        compressed = await resp.read()
+                        
+                        # Decompress
+                        decompressed = gzip.decompress(compressed)
+                        
+                        # Parse JSON
+                        self.instruments = json.loads(decompressed)
+                        
+                        logger.info(f"✅ Loaded {len(self.instruments)} instruments")
+                        return True
+                    else:
+                        logger.error(f"❌ HTTP {resp.status}")
+                        return False
+            
+            except Exception as e:
+                logger.error(f"💥 Download failed: {e}")
+                return False
+    
+    def find_current_month_futures(self):
+        """
+        Find current month futures for our indices
+        
+        Format in JSON:
+        {
+            "instrument_key": "NSE_FO|36702",
+            "exchange_token": "36702",
+            "trading_symbol": "NIFTY 28 NOV 24 FUT",
+            "name": "NIFTY",
+            "segment": "NSE_FO",
+            "instrument_type": "FUT",
+            "expiry": 1732723199000,
+            ...
+        }
+        """
+        logger.info("🔍 Finding current month futures...")
+        
+        now = datetime.now(IST)
+        current_month = now.month
+        current_year = now.year
+        
+        for instrument in self.instruments:
+            # Filter: NSE_FO + FUT only
+            if instrument.get('segment') != 'NSE_FO':
+                continue
+            
+            if instrument.get('instrument_type') != 'FUT':
+                continue
+            
+            name = instrument.get('name', '')
+            
+            # Check if it's one of our indices
+            if name not in INDEX_NAMES:
+                continue
+            
+            # Get expiry timestamp (milliseconds)
+            expiry_ms = instrument.get('expiry', 0)
+            if not expiry_ms:
+                continue
+            
+            # Convert to datetime
+            expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=IST)
+            
+            # Check if expiry is in current or next month
+            # (we want nearest expiry)
+            if expiry_dt < now:
+                continue  # Already expired
+            
+            # If we don't have this index yet, or this expiry is earlier
+            if name not in self.futures_map:
+                self.futures_map[name] = {
+                    'instrument_key': instrument.get('instrument_key'),
+                    'exchange_token': instrument.get('exchange_token'),
+                    'trading_symbol': instrument.get('trading_symbol'),
+                    'expiry': expiry_dt.strftime('%d-%b-%Y'),
+                    'expiry_timestamp': expiry_ms
+                }
+            else:
+                # Replace if this expiry is earlier (nearest expiry)
+                if expiry_ms < self.futures_map[name]['expiry_timestamp']:
+                    self.futures_map[name] = {
+                        'instrument_key': instrument.get('instrument_key'),
+                        'exchange_token': instrument.get('exchange_token'),
+                        'trading_symbol': instrument.get('trading_symbol'),
+                        'expiry': expiry_dt.strftime('%d-%b-%Y'),
+                        'expiry_timestamp': expiry_ms
+                    }
+        
+        # Log results
+        logger.info(f"✅ Found {len(self.futures_map)} futures:")
+        for name, info in self.futures_map.items():
+            logger.info(f"   {name}: {info['instrument_key']}")
+            logger.info(f"      Symbol: {info['trading_symbol']}")
+            logger.info(f"      Expiry: {info['expiry']}")
+        
+        return len(self.futures_map) > 0
+    
+    async def initialize(self):
+        """Download and parse instruments"""
+        success = await self.download_instruments()
+        if not success:
+            return False
+        
+        return self.find_current_month_futures()
 
 # ==================== DATA FETCHER ====================
 class FuturesDataFetcher:
     """Fetch historical candles from Upstox"""
     
-    def __init__(self):
+    def __init__(self, instruments_map):
         self.headers = {
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
+        self.instruments_map = instruments_map
     
     async def fetch_candles(self, index_name: str) -> dict:
         """
@@ -82,22 +187,26 @@ class FuturesDataFetcher:
         Upstox API:
         GET /v2/historical-candle/{instrument_key}/1minute/{to_date}/{from_date}
         
-        Response format: [timestamp, open, high, low, close, volume, oi]
+        Response: [timestamp, open, high, low, close, volume, oi]
         """
-        config = FUTURES_SYMBOLS[index_name]
-        symbol = config['symbol']
+        if index_name not in self.instruments_map:
+            logger.error(f"❌ {index_name}: Not found in instruments")
+            return None
+        
+        info = self.instruments_map[index_name]
+        instrument_key = info['instrument_key']
         
         async with aiohttp.ClientSession() as session:
             # Date range: last 3 days
             to_date = datetime.now(IST).strftime('%Y-%m-%d')
             from_date = (datetime.now(IST) - timedelta(days=3)).strftime('%Y-%m-%d')
             
-            # URL encode symbol
-            enc_symbol = urllib.parse.quote(symbol)
+            # URL encode key
+            enc_key = urllib.parse.quote(instrument_key)
             
-            url = f"https://api.upstox.com/v2/historical-candle/{enc_symbol}/1minute/{to_date}/{from_date}"
+            url = f"https://api.upstox.com/v2/historical-candle/{enc_key}/1minute/{to_date}/{from_date}"
             
-            logger.info(f"🔍 {config['name']}: {symbol}")
+            logger.info(f"🔍 {index_name}: {instrument_key}")
             
             try:
                 async with session.get(url, headers=self.headers) as resp:
@@ -114,7 +223,7 @@ class FuturesDataFetcher:
                             # Last 10 candles
                             last_10 = raw_candles[:10]
                             
-                            # Parse candles
+                            # Parse
                             parsed = []
                             total_vol = 0
                             
@@ -134,9 +243,10 @@ class FuturesDataFetcher:
                             logger.info(f"✅ {index_name}: {len(parsed)} candles | Vol: {total_vol:,}")
                             
                             return {
-                                "index": config['name'],
-                                "symbol": symbol,
-                                "expiry": config['expiry'],
+                                "index": index_name,
+                                "instrument_key": instrument_key,
+                                "trading_symbol": info['trading_symbol'],
+                                "expiry": info['expiry'],
                                 "candles": parsed,
                                 "total_volume": total_vol,
                                 "timestamp": datetime.now(IST).isoformat()
@@ -145,12 +255,12 @@ class FuturesDataFetcher:
                             logger.error(f"❌ {index_name}: Invalid response")
                             return None
                     
-                    elif resp.status == 429:
-                        logger.warning(f"⏳ Rate limit")
-                        return None
-                    
                     elif resp.status == 401:
                         logger.error(f"🔑 Invalid token!")
+                        return None
+                    
+                    elif resp.status == 429:
+                        logger.warning(f"⏳ Rate limit")
                         return None
                     
                     else:
@@ -164,13 +274,13 @@ class FuturesDataFetcher:
                 return None
     
     async def fetch_all_indices(self) -> dict:
-        """Fetch all 4 indices"""
+        """Fetch all indices"""
         results = {
             "fetch_time": datetime.now(IST).strftime('%d-%b-%Y %I:%M:%S %p'),
             "indices": {}
         }
         
-        for index_name in FUTURES_SYMBOLS.keys():
+        for index_name in INDEX_NAMES:
             data = await self.fetch_candles(index_name)
             
             if data:
@@ -180,7 +290,7 @@ class FuturesDataFetcher:
                     "error": "Failed to fetch"
                 }
             
-            # Delay to avoid rate limit
+            # Delay
             await asyncio.sleep(0.5)
         
         return results
@@ -195,7 +305,6 @@ class TelegramSender:
     async def send_data(self, data: dict):
         """Send summary + JSON file"""
         
-        # Summary message
         summary = f"""
 🔥 FUTURES DATA
 
@@ -208,15 +317,14 @@ class TelegramSender:
         
         for idx_name, idx_data in data['indices'].items():
             if 'error' not in idx_data:
-                config = FUTURES_SYMBOLS[idx_name]
                 candles = idx_data.get('candles', [])
                 
                 if candles:
                     latest = candles[0]
                     summary += f"""
-📈 {config['name']}
-   Symbol: {idx_data['symbol']}
-   Expiry: {config['expiry']}
+📈 {idx_name}
+   Symbol: {idx_data['trading_symbol']}
+   Expiry: {idx_data['expiry']}
    Candles: {len(candles)}
    Volume: {idx_data['total_volume']:,}
    Latest: ₹{latest['close']:.2f}
@@ -225,12 +333,12 @@ class TelegramSender:
 """
             else:
                 summary += f"""
-❌ {FUTURES_SYMBOLS[idx_name]['name']}
+❌ {idx_name}
    Status: Failed
 
 """
         
-        summary += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n📎 JSON file attached"
+        summary += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n📎 JSON attached"
         
         try:
             # Send summary
@@ -239,7 +347,7 @@ class TelegramSender:
                 text=summary
             )
             
-            # Send JSON file
+            # Send JSON
             from io import BytesIO
             
             json_str = json.dumps(data, indent=2)
@@ -255,19 +363,33 @@ class TelegramSender:
             logger.info("✅ Sent to Telegram")
         
         except Exception as e:
-            logger.error(f"❌ Telegram error: {e}")
+            logger.error(f"❌ Telegram: {e}")
 
 # ==================== MAIN ====================
 async def main():
     """Main loop"""
     
     logger.info("=" * 80)
-    logger.info("🚀 FUTURES DATA BOT - WORKING VERSION")
+    logger.info("🚀 FUTURES DATA BOT - JSON VERSION")
     logger.info("=" * 80)
     logger.info("")
-    logger.info("📊 Indices:")
-    for name, config in FUTURES_SYMBOLS.items():
-        logger.info(f"   {config['name']}: {config['symbol']}")
+    
+    # Initialize instruments
+    logger.info("📥 Loading instruments from Upstox...")
+    instruments_fetcher = InstrumentsFetcher()
+    
+    success = await instruments_fetcher.initialize()
+    if not success:
+        logger.error("❌ Failed to load instruments!")
+        logger.error("   Check internet connection")
+        return
+    
+    if len(instruments_fetcher.futures_map) == 0:
+        logger.error("❌ No futures found!")
+        return
+    
+    logger.info("")
+    logger.info("✅ Instruments loaded successfully")
     logger.info("")
     logger.info("⏱️ Interval: 60 seconds")
     logger.info("📦 Data: Last 10 candles (1-min)")
@@ -275,7 +397,8 @@ async def main():
     logger.info("=" * 80)
     logger.info("")
     
-    fetcher = FuturesDataFetcher()
+    # Create fetcher and sender
+    fetcher = FuturesDataFetcher(instruments_fetcher.futures_map)
     sender = TelegramSender()
     
     iteration = 0
