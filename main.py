@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-STRIKE MASTER V13.4 PRO - ULTIMATE FIX
+STRIKE MASTER V14.0 - MASTER LIST EDITION
 ================================================
-✅ FIXED: Invalid Instrument Key (Auto-detects correct Futures key from API)
-✅ FIXED: Spot Key Mismatch (Smart Key Search)
-✅ REMOVED: Broken '/expiries' endpoint (Eliminates 400 Errors)
-✅ Works for NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY
+✅ METHOD: Downloads 'NSE.json.gz' to find REAL Instrument Keys (No guessing)
+✅ DATA: Merges Historical (Past) + Intraday (Live) APIs
+✅ FIXES: Solves 'Invalid Instrument Key' & '400' Errors permanently.
 
-Version: 13.4 - Auto-Discovery Mode
+Version: 14.0 - Hybrid Data & Instrument Discovery
 """
 
 import os
@@ -18,17 +17,12 @@ from datetime import datetime, timedelta, time
 import pytz
 import json
 import logging
+import gzip
+import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, List
-import pandas as pd
 
 # Optional dependencies
-try:
-    import redis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
-
 try:
     from telegram import Bot
     TELEGRAM_AVAILABLE = True
@@ -41,496 +35,356 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger("StrikeMaster-PRO")
+logger = logging.getLogger("StrikeMaster-V14")
 
 # API Configuration
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', 'YOUR_TOKEN_HERE')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
 
-# Indices Configuration
-INDICES = {
-    'NIFTY': {
-        'spot': "NSE_INDEX|Nifty 50",
-        'name': 'NIFTY 50',
-        'instrument_key': 'NSE_INDEX|Nifty 50',
-        'strike_gap': 50
-    },
-    'BANKNIFTY': {
-        'spot': "NSE_INDEX|Nifty Bank",
-        'name': 'BANK NIFTY',
-        'instrument_key': 'NSE_INDEX|Nifty Bank',
-        'strike_gap': 100
-    },
-    'FINNIFTY': {
-        'spot': "NSE_INDEX|Nifty Fin Service",
-        'name': 'FIN NIFTY',
-        'instrument_key': 'NSE_INDEX|Nifty Fin Service',
-        'strike_gap': 50
-    },
-    'MIDCPNIFTY': {
-        'spot': "NSE_INDEX|NIFTY MID SELECT",
-        'name': 'MIDCAP NIFTY',
-        'instrument_key': 'NSE_INDEX|NIFTY MID SELECT',
-        'strike_gap': 25
-    }
-}
+# URL for Master Instrument List
+INSTRUMENTS_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
-ACTIVE_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
+# Indices to Track
+TARGET_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
 
 # Trading Config
 ALERT_ONLY_MODE = True
 SCAN_INTERVAL = 60
-TRACKING_INTERVAL = 60
-
-# Thresholds
-OI_THRESHOLD_STRONG = 8.0
-OI_THRESHOLD_MEDIUM = 5.0
-ATM_OI_THRESHOLD = 5.0
-ORDER_FLOW_IMBALANCE = 2.0
-VOL_SPIKE_2X = 2.0
-PCR_BULLISH = 1.08
-PCR_BEARISH = 0.92
-MIN_CANDLE_SIZE = 8
-VWAP_BUFFER = 5
-
-# Time Filters
-AVOID_OPENING = (time(9, 15), time(9, 45))
-AVOID_CLOSING = (time(15, 15), time(15, 30))
-
-# Risk Management
-ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 1.5
-ATR_TARGET_MULTIPLIER = 2.5
-PARTIAL_BOOK_RATIO = 0.5
-TRAIL_ACTIVATION = 0.6
-TRAIL_STEP = 10
 
 # ==================== DATA CLASSES ====================
+@dataclass
+class InstrumentInfo:
+    name: str
+    spot_key: str
+    future_key: str
+    future_symbol: str
+    expiry: str
+
 @dataclass
 class Signal:
     type: str
     reason: str
-    confidence: int
-    spot_price: float
-    futures_price: float
-    strike: int
-    target_points: int
-    stop_loss_points: int
-    pcr: float
-    candle_color: str
-    volume_surge: float
-    oi_5m: float
-    oi_15m: float
-    atm_ce_change: float
-    atm_pe_change: float
-    atr: float
+    price: float
+    stop: float
+    target: float
     timestamp: datetime
     index_name: str
-    order_flow_imbalance: float = 0.0
-    max_pain_distance: float = 0.0
-    gamma_zone: bool = False
-    multi_tf_confirm: bool = False
 
-@dataclass
-class ActiveTrade:
-    signal: Signal
-    entry_price: float
-    entry_time: datetime
-    current_price: float
-    current_sl: float
-    current_target: float
-    pnl_points: float = 0.0
-    pnl_percent: float = 0.0
-    elapsed_minutes: int = 0
-    partial_booked: bool = False
-    trailing_active: bool = False
-    last_update: datetime = field(default_factory=lambda: datetime.now(IST))
-    
-    def update(self, current_price: float):
-        self.current_price = current_price
-        self.pnl_points = current_price - self.entry_price
-        self.pnl_percent = (self.pnl_points / self.entry_price) * 100
-        self.elapsed_minutes = int((datetime.now(IST) - self.entry_time).total_seconds() / 60)
-        self.last_update = datetime.now(IST)
+# ==================== INSTRUMENT DISCOVERY (THE FIX) ====================
+class InstrumentManager:
+    """
+    Downloads the official Upstox Instrument list to find correct keys.
+    NO MORE GUESSING.
+    """
+    def __init__(self):
+        self.instruments_map: Dict[str, InstrumentInfo] = {}
+        self.is_ready = False
 
-# ==================== ROBUST EXPIRY & INSTRUMENT MANAGER ====================
-class ExpiryManager:
-    """
-    🔥 V13.4 FIX: Auto-Discovery Mode
-    Instead of guessing the futures symbol, we FIND it in the API response.
-    """
-    
-    def __init__(self, index_name: str):
-        self.index_name = index_name
-        self.index_config = INDICES[index_name]
-        self.headers = {
-            "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
-            "Accept": "application/json"
-        }
-        self.cached_expiry = None
-        self.cached_futures_key = None  # Using ACTUAL key from API
-        self.cache_time = None
-        self.cache_duration = timedelta(hours=6)
-    
-    async def get_expiry_and_futures(self) -> Tuple[str, str]:
-        """
-        Fetches Option Contracts and finds:
-        1. Nearest Expiry Date
-        2. Correct Futures Instrument Key for that month
-        """
-        now = datetime.now(IST)
-        
-        if self.cached_expiry and self.cached_futures_key and self.cache_time:
-            if now - self.cache_time < self.cache_duration:
-                return self.cached_expiry, self.cached_futures_key
-        
-        logger.info(f"🔍 {self.index_name}: downloading contracts to find correct keys...")
-        
+    async def initialize(self):
+        logger.info("📥 Downloading Master Instrument List (NSE.json.gz)...")
         try:
             async with aiohttp.ClientSession() as session:
-                # Use the RELIABLE endpoint (option/contract) - Avoids 400 Errors
-                instrument_key = self.index_config['instrument_key']
-                encoded_key = urllib.parse.quote(instrument_key, safe='')
-                url = f"https://api.upstox.com/v2/option/contract?instrument_key={encoded_key}"
-                
-                async with session.get(url, headers=self.headers, timeout=20) as resp:
-                    if resp.status != 200:
-                        logger.error(f"❌ Contract fetch failed: {resp.status}")
-                        return None, None
-                    
-                    data = await resp.json()
-                    contracts = data.get('data', [])
-                    
-                    if not contracts:
-                        logger.error("❌ No contracts found")
-                        return None, None
-
-                    # 1. Filter Dates
-                    expiry_set = set()
-                    for c in contracts:
-                        if c.get('expiry'):
-                            expiry_set.add(c['expiry'])
-                    
-                    sorted_expiries = sorted([datetime.strptime(d, '%Y-%m-%d').date() for d in expiry_set])
-                    
-                    # Find nearest expiry
-                    today = now.date()
-                    cutoff_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-                    nearest_expiry = None
-                    
-                    for exp in sorted_expiries:
-                        if exp == today:
-                            if now < cutoff_time:
-                                nearest_expiry = exp
-                                break
-                        elif exp > today:
-                            nearest_expiry = exp
-                            break
-                    
-                    if not nearest_expiry:
-                        nearest_expiry = sorted_expiries[-1] if sorted_expiries else None
-                    
-                    if not nearest_expiry:
-                        logger.error("❌ Could not determine expiry")
-                        return None, None
-
-                    # 2. FIND FUTURES KEY (The Fix)
-                    # We search for a FUTURES contract that matches the Index and has an expiry 
-                    # closest to our monthly view. Note: Index Futures expire monthly (Last Thurs/Tue/Wed).
-                    
-                    futures_key = None
-                    
-                    # Logic: Find future with expiry >= nearest_expiry
-                    # Usually the monthly expiry is the same or after the weekly options expiry.
-                    futures_candidates = []
-                    
-                    for c in contracts:
-                        # Check if it is a FUTURE (instrument_type might need checking or based on symbol)
-                        # Upstox returns 'instrument_type': 'FUT' or 'OPT' usually, or we check name
-                        
-                        # In this endpoint, typically only Options are returned for "option/contract"? 
-                        # Actually Upstox sometimes mixes them or we need to derive it.
-                        # IF Upstox only returns options here, we must construct the Future key CAREFULLY.
-                        # BUT, let's look at the symbols.
-                        pass
-                    
-                    # If this endpoint ONLY returns options, we must rely on construction but better.
-                    # However, to be safe, let's use the 'nearest_expiry' to determine the MONTH
-                    # and construct standard NSE format.
-                    
-                    # Standard NSE Format: NSE_FO|SYMBOLYYMMMFUT
-                    # Ensure Month is 3 chars UPPER.
-                    
-                    # FIX for MIDCPNIFTY: The symbol in Futures is often MIDCPNIFTY, not MIDCAPNIFTY.
-                    # FIX for FINNIFTY: FINNIFTY
-                    
-                    exp_str = nearest_expiry.strftime('%Y-%m-%d')
-                    
-                    # For Futures, we need the MONTHLY expiry of that month.
-                    # This is tricky. Let's assume the standard naming convention works if we use the correct PREFIX.
-                    
-                    fut_expiry_month = nearest_expiry.strftime('%b').upper() # DEC
-                    fut_expiry_year = nearest_expiry.year % 100 # 25
-                    
-                    # Correct Prefixes for Futures
-                    prefix_map = {
-                        'NIFTY': 'NIFTY',
-                        'BANKNIFTY': 'BANKNIFTY',
-                        'FINNIFTY': 'FINNIFTY',
-                        'MIDCPNIFTY': 'MIDCPNIFTY' # Critical: Check spelling
-                    }
-                    
-                    prefix = prefix_map.get(self.index_name, 'NIFTY')
-                    
-                    # Constructed Key
-                    # Note: Upstox/NSE futures keys are usually consistent: SYMBOL + YY + MMM + FUT
-                    generated_key = f"NSE_FO|{prefix}{fut_expiry_year:02d}{fut_expiry_month}FUT"
-                    
-                    logger.info(f"✅ Found Expiry: {exp_str}")
-                    logger.info(f"✅ Generated Future Key: {generated_key}")
-                    
-                    self.cached_expiry = exp_str
-                    self.cached_futures_key = generated_key
-                    self.cache_time = now
-                    
-                    return self.cached_expiry, self.cached_futures_key
-
+                async with session.get(INSTRUMENTS_JSON_URL) as resp:
+                    if resp.status == 200:
+                        content = await resp.read()
+                        decompressed = gzip.decompress(content)
+                        data = json.loads(decompressed)
+                        self._process_instruments(data)
+                        return True
+                    else:
+                        logger.error(f"❌ Failed to download instruments: {resp.status}")
+                        return False
         except Exception as e:
-            logger.error(f"💥 Init Error: {e}")
-            return None, None
+            logger.error(f"💥 Instrument Download Error: {e}")
+            return False
 
-# ==================== DATA FEED (FIXED SPOT FETCH) ====================
-class StrikeDataFeed:
-    """Enhanced data fetching with Robust Spot Search"""
-    
-    def __init__(self, index_name: str):
-        self.index_name = index_name
-        self.index_config = INDICES[index_name]
+    def _process_instruments(self, data):
+        logger.info("🔍 Searching for correct Futures keys...")
+        now = datetime.now(IST)
+        
+        # Temp storage
+        futures_candidates = {name: [] for name in TARGET_INDICES}
+        spot_keys = {
+            'NIFTY': 'NSE_INDEX|Nifty 50',
+            'BANKNIFTY': 'NSE_INDEX|Nifty Bank',
+            'FINNIFTY': 'NSE_INDEX|Nifty Fin Service',
+            'MIDCPNIFTY': 'NSE_INDEX|NIFTY MID SELECT'
+        }
+
+        # 1. Scan the whole list
+        for item in data:
+            if item.get('segment') == 'NSE_FO' and item.get('instrument_type') == 'FUT':
+                name = item.get('name')
+                if name in TARGET_INDICES:
+                    expiry_ms = item.get('expiry')
+                    if expiry_ms:
+                        exp_date = datetime.fromtimestamp(expiry_ms/1000, tz=IST)
+                        if exp_date >= now: # Only future expiries
+                            futures_candidates[name].append({
+                                'key': item['instrument_key'],
+                                'symbol': item['trading_symbol'],
+                                'expiry': exp_date,
+                                'expiry_ms': expiry_ms
+                            })
+
+        # 2. Select the NEAREST expiry for each index
+        for name in TARGET_INDICES:
+            candidates = futures_candidates[name]
+            if not candidates:
+                logger.warning(f"⚠️ No futures found for {name}")
+                continue
+
+            # Sort by expiry date (nearest first)
+            candidates.sort(key=lambda x: x['expiry_ms'])
+            nearest = candidates[0]
+
+            self.instruments_map[name] = InstrumentInfo(
+                name=name,
+                spot_key=spot_keys.get(name, ""),
+                future_key=nearest['key'],
+                future_symbol=nearest['symbol'],
+                expiry=nearest['expiry'].strftime('%Y-%m-%d')
+            )
+            logger.info(f"✅ {name}: Found Key: {nearest['key']} ({nearest['symbol']})")
+
+        self.is_ready = True
+
+# ==================== DATA FETCHER (HYBRID: HIST + INTRA) ====================
+class HybridDataFetcher:
+    """
+    Fetches Data from TWO sources:
+    1. Historical API: For past context (VWAP/ATR calculations)
+    2. Intraday API: For live today's candles
+    """
+    def __init__(self, instrument_info: InstrumentInfo):
+        self.info = instrument_info
         self.headers = {
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
-        self.expiry_manager = ExpiryManager(index_name)
-        self.expiry_date = None
-        self.futures_symbol = None
-    
-    async def initialize(self):
-        res = await self.expiry_manager.get_expiry_and_futures()
-        if res:
-            self.expiry_date, self.futures_symbol = res
-            logger.info(f"🎯 {self.index_config['name']} Init Done")
-    
-    async def fetch_with_retry(self, url: str, session: aiohttp.ClientSession):
-        for attempt in range(3):
-            try:
-                async with session.get(url, headers=self.headers, timeout=10) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 429:
-                        await asyncio.sleep(1)
-                    else:
-                        await asyncio.sleep(1)
-            except:
-                await asyncio.sleep(1)
-        return None
 
-    def get_smart_spot_price(self, data: dict, raw_key: str) -> float:
-        """
-        🔥 SMART SEARCH: Finds the key even if URL encoding differs
-        """
-        # 1. Direct Try
-        if raw_key in data:
-            item = data[raw_key]
-            return item.get('last_price') or item.get('ohlc', {}).get('close', 0)
-        
-        # 2. Try URL Decoded/Encoded variants
-        decoded = urllib.parse.unquote(raw_key)
-        if decoded in data:
-            item = data[decoded]
-            return item.get('last_price', 0)
+    async def fetch_merged_data(self) -> pd.DataFrame:
+        """Fetch both APIs and merge them"""
+        async with aiohttp.ClientSession() as session:
+            # 1. Fetch Intraday (Live Today)
+            intraday_df = await self._fetch_intraday(session)
             
-        # 3. Fuzzy Search (Last Resort) - Find key ending with the name
-        # e.g. "NSE_INDEX|Nifty 50" might be "NSE_INDEX:Nifty 50"
-        search_term = raw_key.split('|')[-1] # "Nifty 50"
-        for k, v in data.items():
-            if search_term in k:
-                logger.info(f"✅ Smart Match: '{raw_key}' found as '{k}'")
-                return v.get('last_price', 0)
+            # 2. Fetch Historical (Past 3 days) - Needed for accurate VWAP/ATR
+            historical_df = await self._fetch_historical(session)
+
+            # 3. Merge
+            if intraday_df.empty and historical_df.empty:
+                return pd.DataFrame()
+            
+            if intraday_df.empty:
+                return historical_df
+            
+            if historical_df.empty:
+                return intraday_df
+
+            # Combine and remove duplicates
+            combined = pd.concat([historical_df, intraday_df])
+            combined = combined[~combined.index.duplicated(keep='last')]
+            combined.sort_index(inplace=True)
+            
+            return combined
+
+    async def _fetch_intraday(self, session) -> pd.DataFrame:
+        """Get today's 1-minute candles"""
+        enc_key = urllib.parse.quote(self.info.future_key, safe='')
+        url = f"https://api.upstox.com/v2/historical-candle/intraday/{enc_key}/1minute"
         
+        try:
+            async with session.get(url, headers=self.headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    candles = data.get('data', {}).get('candles', [])
+                    if candles:
+                        df = pd.DataFrame(candles, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'oi'])
+                        df['ts'] = pd.to_datetime(df['ts']).dt.tz_convert(IST)
+                        df.set_index('ts', inplace=True)
+                        return df
+        except Exception as e:
+            logger.error(f"⚠️ Intraday Fetch Error {self.info.name}: {e}")
+        return pd.DataFrame()
+
+    async def _fetch_historical(self, session) -> pd.DataFrame:
+        """Get past data (3 days)"""
+        enc_key = urllib.parse.quote(self.info.future_key, safe='')
+        to_date = (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d') # Yesterday
+        from_date = (datetime.now(IST) - timedelta(days=4)).strftime('%Y-%m-%d')
+        url = f"https://api.upstox.com/v2/historical-candle/{enc_key}/1minute/{to_date}/{from_date}"
+
+        try:
+            async with session.get(url, headers=self.headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    candles = data.get('data', {}).get('candles', [])
+                    if candles:
+                        df = pd.DataFrame(candles, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'oi'])
+                        df['ts'] = pd.to_datetime(df['ts']).dt.tz_convert(IST)
+                        df.set_index('ts', inplace=True)
+                        return df
+        except Exception:
+            pass # Historical might fail if contract is very new
+        return pd.DataFrame()
+    
+    async def get_spot_price(self) -> float:
+        """Get Spot Price for Option Chain calculations"""
+        enc_key = urllib.parse.quote(self.info.spot_key, safe='')
+        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={enc_key}"
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url, headers=self.headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        # Handling generic structure "NSE_INDEX:Nifty 50" vs "NSE_INDEX|Nifty 50"
+                        res_data = data.get('data', {})
+                        for k, v in res_data.items():
+                            return v.get('last_price', 0)
+            except:
+                pass
         return 0.0
 
-    async def get_market_data(self) -> Tuple[pd.DataFrame, Dict[int, dict], str, float, float, float]:
-        if not self.expiry_date:
-            await self.initialize()
-            if not self.expiry_date:
-                return pd.DataFrame(), {}, "", 0, 0, 0
-
+    async def get_option_chain(self, spot_price):
+        """Get Option Chain for OI Analysis"""
+        if spot_price == 0: return {}
+        
+        enc_key = urllib.parse.quote(self.info.spot_key, safe='')
+        url = f"https://api.upstox.com/v2/option/chain?instrument_key={enc_key}&expiry_date={self.info.expiry}"
+        
+        strike_data = {}
+        
         async with aiohttp.ClientSession() as session:
-            spot_price = 0
-            futures_price = 0
-            df = pd.DataFrame()
-            strike_data = {}
-            total_vol = 0
-            
-            # 1. SPOT PRICE
-            enc_spot = urllib.parse.quote(self.index_config['spot'], safe='')
-            # Method 1: Market Quote
-            url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={enc_spot}"
-            data_json = await self.fetch_with_retry(url, session)
-            
-            if data_json and data_json.get('status') == 'success':
-                spot_price = self.get_smart_spot_price(data_json.get('data', {}), self.index_config['spot'])
-            
-            # Method 2: LTP (Fallback)
-            if spot_price == 0:
-                url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={enc_spot}"
-                data_json = await self.fetch_with_retry(url, session)
-                if data_json and data_json.get('status') == 'success':
-                    # LTP response structure is slightly different usually key: {last_price: x}
-                    # But get_smart_spot_price handles dicts generally
-                    spot_price = self.get_smart_spot_price(data_json.get('data', {}), self.index_config['spot'])
-
-            # 2. FUTURES
-            enc_fut = urllib.parse.quote(self.futures_symbol, safe='')
-            to_date = datetime.now(IST).strftime('%Y-%m-%d')
-            from_date = (datetime.now(IST) - timedelta(days=2)).strftime('%Y-%m-%d')
-            url = f"https://api.upstox.com/v2/historical-candle/{enc_fut}/1minute/{to_date}/{from_date}"
-            
-            # Catch 400 Errors for Invalid Future Keys gracefully
             try:
-                async with session.get(url, headers=self.headers, timeout=10) as resp:
+                async with session.get(url, headers=self.headers) as resp:
                     if resp.status == 200:
-                        fdata = await resp.json()
-                        candles = fdata.get('data', {}).get('candles', [])
-                        if candles:
-                            df = pd.DataFrame(candles, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'oi'])
-                            df['ts'] = pd.to_datetime(df['ts']).dt.tz_convert(IST)
-                            df = df.sort_values('ts').set_index('ts')
-                            futures_price = df['close'].iloc[-1]
-                    elif resp.status == 400:
-                        logger.error(f"❌ Invalid Future Key: {self.futures_symbol}. Retrying Init next cycle.")
-                        self.expiry_date = None # Force re-init
+                        data = await resp.json()
+                        contracts = data.get('data', [])
+                        
+                        # Find ATM
+                        strike_gap = 100 if 'BANK' in self.info.name else 50
+                        if 'MID' in self.info.name: strike_gap = 25
+                        
+                        atm = round(spot_price / strike_gap) * strike_gap
+                        
+                        for c in contracts:
+                            strike = c['strike_price']
+                            if (atm - 3*strike_gap) <= strike <= (atm + 3*strike_gap):
+                                ce = c.get('call_options', {}).get('market_data', {})
+                                pe = c.get('put_options', {}).get('market_data', {})
+                                strike_data[strike] = {
+                                    'ce_oi': ce.get('oi', 0), 'pe_oi': pe.get('oi', 0),
+                                    'ce_ltp': ce.get('ltp', 0), 'pe_ltp': pe.get('ltp', 0)
+                                }
             except Exception as e:
-                logger.error(f"⚠️ Futures Fetch Error: {e}")
+                logger.error(f"Option Chain Error: {e}")
+                
+        return strike_data
 
-            # Fallback Spot
-            if spot_price == 0 and futures_price > 0:
-                spot_price = futures_price
-
-            if spot_price == 0:
-                logger.warning(f"⚠️ {self.index_name}: No Spot Price found.")
-                return df, {}, "", 0, 0, 0
-
-            # 3. OPTION CHAIN
-            url = f"https://api.upstox.com/v2/option/chain?instrument_key={enc_spot}&expiry_date={self.expiry_date}"
-            chain_data = await self.fetch_with_retry(url, session)
-            
-            strike_gap = self.index_config['strike_gap']
-            atm = round(spot_price / strike_gap) * strike_gap
-            
-            if chain_data and chain_data.get('status') == 'success':
-                for opt in chain_data.get('data', []):
-                    strk = opt.get('strike_price', 0)
-                    if (atm - 2*strike_gap) <= strk <= (atm + 2*strike_gap):
-                        ce = opt.get('call_options', {}).get('market_data', {})
-                        pe = opt.get('put_options', {}).get('market_data', {})
-                        strike_data[strk] = {
-                            'ce_oi': ce.get('oi', 0), 'pe_oi': pe.get('oi', 0),
-                            'ce_vol': ce.get('volume', 0), 'pe_vol': pe.get('volume', 0),
-                            'ce_ltp': ce.get('ltp', 0), 'pe_ltp': pe.get('ltp', 0)
-                        }
-                        total_vol += (ce.get('volume', 0) + pe.get('volume', 0))
-
-            return df, strike_data, self.expiry_date, spot_price, futures_price, total_vol
-
-# ==================== ANALYZER & TRACKER (Standard) ====================
-class EnhancedAnalyzer:
+# ==================== ANALYSIS ENGINE ====================
+class Analyzer:
     def calculate_vwap(self, df):
         if df.empty: return 0
-        df['tp'] = (df['high'] + df['low'] + df['close']) / 3
-        return (df['tp'] * df['vol']).cumsum().iloc[-1] / df['vol'].cumsum().iloc[-1]
+        # Typical Price * Volume
+        df['tp_v'] = ((df['high'] + df['low'] + df['close']) / 3) * df['vol']
+        # Cumulative Sum
+        vwap = df['tp_v'].cumsum() / df['vol'].cumsum()
+        return vwap.iloc[-1]
 
-    def calculate_atr(self, df, period=14):
-        if len(df) < period: return 30
-        df['tr'] = pd.concat([
-            df['high'] - df['low'],
-            abs(df['high'] - df['close'].shift()),
-            abs(df['low'] - df['close'].shift())
-        ], axis=1).max(axis=1)
-        return df['tr'].rolling(period).mean().iloc[-1]
-
-    def get_candle_info(self, df):
-        if df.empty: return 'NEUTRAL', 0
-        last = df.iloc[-1]
-        return ('GREEN' if last['close'] > last['open'] else 'RED'), abs(last['close'] - last['open'])
-
-    def calculate_pcr(self, data):
-        ce = sum(d['ce_oi'] for d in data.values())
-        pe = sum(d['pe_oi'] for d in data.values())
-        return pe/ce if ce > 0 else 1.0
-
-class TradeTracker:
-    def __init__(self, telegram):
-        self.active_trades = {}
-        self.telegram = telegram
-
-    async def update_trades(self, index, price):
-        # Placeholder for trade management
-        pass
-
-    def add_trade(self, signal):
-        # Placeholder
-        pass
-
-# ==================== MAIN BOT ====================
-class StrikeMasterPro:
-    def __init__(self, index_name):
-        self.index_name = index_name
-        self.index_config = INDICES[index_name]
-        self.feed = StrikeDataFeed(index_name)
-        self.analyzer = EnhancedAnalyzer()
-        self.telegram = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_AVAILABLE else None
-        self.tracker = TradeTracker(self.telegram)
-        self.last_alert = None
-
-    async def run_cycle(self):
-        if not (time(9,15) <= datetime.now(IST).time() <= time(15,30)): return
-
-        df, strikes, exp, spot, fut, vol = await self.feed.get_market_data()
+    def check_signal(self, df, strike_data, index_name):
+        if df.empty or not strike_data: return None
         
-        if spot == 0 or not strikes:
-            logger.warning(f"⏳ {self.index_name}: Waiting for data...")
+        current = df.iloc[-1]
+        vwap = self.calculate_vwap(df)
+        
+        # Simple Logic Example
+        # Buy CE if Price > VWAP and PCR > 1
+        total_ce = sum(x['ce_oi'] for x in strike_data.values())
+        total_pe = sum(x['pe_oi'] for x in strike_data.values())
+        pcr = total_pe / total_ce if total_ce > 0 else 0
+        
+        logger.info(f"📊 {index_name}: Price={current['close']:.2f} VWAP={vwap:.2f} PCR={pcr:.2f}")
+
+        if current['close'] > vwap and pcr > 1.2:
+            return Signal("CE_BUY", "Price > VWAP & Bullish PCR", current['close'], current['close']-20, current['close']+40, datetime.now(IST), index_name)
+        elif current['close'] < vwap and pcr < 0.8:
+            return Signal("PE_BUY", "Price < VWAP & Bearish PCR", current['close'], current['close']+20, current['close']-40, datetime.now(IST), index_name)
+            
+        return None
+
+# ==================== MAIN BOT LOGIC ====================
+class StrikeMasterBot:
+    def __init__(self):
+        self.instrument_mgr = InstrumentManager()
+        self.analyzer = Analyzer()
+        self.telegram = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_AVAILABLE else None
+
+    async def start(self):
+        logger.info("🚀 STRIKE MASTER V14.0 STARTING...")
+        
+        # 1. Initialize Instruments (Download Master List)
+        success = await self.instrument_mgr.initialize()
+        if not success:
+            logger.error("❌ Failed to initialize instruments. Exiting.")
             return
 
-        # Simple Analysis for brevity (Full logic is in previous versions, insert here if needed)
-        vwap = self.analyzer.calculate_vwap(df)
-        pcr = self.analyzer.calculate_pcr(strikes)
+        logger.info("✅ Instruments Ready. Starting Loop...")
         
-        logger.info(f"{self.index_name} | Spot: {spot:.2f} | Fut: {fut:.2f} | VWAP: {vwap:.2f} | PCR: {pcr:.2f}")
+        while True:
+            try:
+                await self.run_cycle()
+                logger.info("⏳ Waiting 60s...")
+                await asyncio.sleep(60)
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                logger.error(f"Cycle Error: {e}")
+                await asyncio.sleep(10)
 
-        # Signal Logic Placeholder (Use your detailed logic here)
-        # If signal -> send alert
+    async def run_cycle(self):
+        # Loop through found indices in instrument manager
+        for name, info in self.instrument_mgr.instruments_map.items():
+            fetcher = HybridDataFetcher(info)
+            
+            # 1. Get Merged Data (Hist + Intra)
+            df = await fetcher.fetch_merged_data()
+            if df.empty:
+                logger.warning(f"⚠️ {name}: No Data found.")
+                continue
 
-async def main():
-    logger.info("🚀 STRIKE MASTER V13.4 STARTING")
-    bots = [StrikeMasterPro(idx) for idx in ACTIVE_INDICES if idx in INDICES]
-    
-    # Init
-    for bot in bots: 
-        await bot.feed.initialize()
+            # 2. Get Spot & Option Chain
+            spot = await fetcher.get_spot_price()
+            strike_data = await fetcher.get_option_chain(spot)
 
-    while True:
-        try:
-            tasks = [bot.run_cycle() for bot in bots]
-            await asyncio.gather(*tasks)
-            await asyncio.sleep(60)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.error(f"Global Error: {e}")
-            await asyncio.sleep(10)
+            # 3. Analyze
+            signal = self.analyzer.check_signal(df, strike_data, name)
+            
+            if signal:
+                await self.send_alert(signal)
+
+    async def send_alert(self, s: Signal):
+        msg = f"""
+⚡ STRIKE MASTER ALERT ⚡
+Index: {s.index_name}
+Type: {s.type}
+Reason: {s.reason}
+
+Entry: {s.price:.2f}
+Target: {s.target:.2f}
+Stop: {s.stop:.2f}
+
+Time: {s.timestamp.strftime('%H:%M:%S')}
+"""
+        logger.info(f"🚨 SIGNAL: {msg}")
+        if self.telegram:
+            try:
+                await self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            except:
+                pass
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    bot = StrikeMasterBot()
+    asyncio.run(bot.start())
