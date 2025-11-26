@@ -185,28 +185,53 @@ class ActiveTrade:
 
 # ==================== UTILITIES ====================
 def get_current_futures_symbol(index_name: str) -> str:
-    """Auto-detect futures symbol"""
+    """Auto-detect futures symbol with expiry validation"""
     now = datetime.now(IST)
     year = now.year
     month = now.month
     
     config = INDICES[index_name]
     expiry_day_of_week = config['expiry_day']
+    expiry_type = config.get('expiry_type', 'weekly')
     
+    # Calculate current month expiry
     last_day = monthrange(year, month)[1]
     last_date = datetime(year, month, last_day, tzinfo=IST)
     days_back = (last_date.weekday() - expiry_day_of_week) % 7
     expiry_date = last_date - timedelta(days=days_back)
     
-    if now.date() > expiry_date.date() or (
-        now.date() == expiry_date.date() and now.time() > time(15, 30)
-    ):
-        if month == 12:
-            year += 1
-            month = 1
-        else:
-            month += 1
+    # If weekly, get nearest upcoming weekly expiry
+    if expiry_type == 'weekly':
+        # Find next occurrence of expiry day
+        days_until = (expiry_day_of_week - now.weekday() + 7) % 7
+        if days_until == 0:
+            days_until = 7  # Next week if today is expiry day
+        expiry_date = now + timedelta(days=days_until)
     
+    # Check if expiry has passed (today after 3:30 PM or future date)
+    expiry_cutoff = expiry_date.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    if now >= expiry_cutoff:
+        logger.info(f"⚠️ {index_name} expiry passed, using next expiry")
+        
+        if expiry_type == 'weekly':
+            # Next week
+            expiry_date = expiry_date + timedelta(days=7)
+        else:
+            # Next month
+            if month == 12:
+                year += 1
+                month = 1
+            else:
+                month += 1
+            
+            last_day = monthrange(year, month)[1]
+            last_date = datetime(year, month, last_day, tzinfo=IST)
+            days_back = (last_date.weekday() - expiry_day_of_week) % 7
+            expiry_date = last_date - timedelta(days=days_back)
+    
+    year = expiry_date.year
+    month = expiry_date.month
     year_short = year % 100
     month_name = datetime(year, month, 1).strftime('%b').upper()
     
@@ -218,7 +243,11 @@ def get_current_futures_symbol(index_name: str) -> str:
     }
     prefix = prefix_map.get(index_name, 'NIFTY')
     
-    return f"NSE_FO|{prefix}{year_short:02d}{month_name}FUT"
+    symbol = f"NSE_FO|{prefix}{year_short:02d}{month_name}FUT"
+    
+    expiry_str = expiry_date.strftime('%d-%b-%Y')
+    logger.info(f"🎯 {config['name']}: {symbol} (Expiry: {expiry_str})")
+    return symbol
 
 def get_expiry_date(index_name: str) -> str:
     """Get next expiry - FIXED for weekly/monthly"""
