@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-NIFTY50 HYBRID DATA BOT
-=======================
-✅ Monthly Futures: 500 candles + Volume data
-✅ Weekly Options: Option chain (5 strikes ATM ±2)
-✅ Auto-detects nearest Tuesday expiry for options
-✅ Sends to Telegram every 60 seconds
+NIFTY50 HYBRID DATA BOT - FIXED VERSION
+========================================
+✅ Monthly Futures: 500 candles from intraday API
+✅ Weekly Options: Option chain API (5 strikes)
+✅ Uses proper Upstox API endpoints
 """
 
 import os
@@ -33,7 +32,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger("NiftyHybridBot")
+logger = logging.getLogger("NiftyBot")
 
 # API Credentials
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', 'YOUR_TOKEN_HERE')
@@ -43,13 +42,15 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 # Upstox Instruments JSON URL
 INSTRUMENTS_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
+# NIFTY50 Index key for option chain
+NIFTY_INDEX_KEY = "NSE_INDEX|Nifty 50"
+
 # ==================== EXPIRY CALCULATOR ====================
 def get_next_tuesday_expiry(from_date=None):
-    """Calculate next Tuesday expiry for NIFTY50 weekly options"""
+    """Calculate next Tuesday expiry for weekly options"""
     if from_date is None:
         from_date = datetime.now(IST)
     
-    # Find next Tuesday
     days_until_tuesday = (1 - from_date.weekday()) % 7
     
     if days_until_tuesday == 0:
@@ -61,19 +62,17 @@ def get_next_tuesday_expiry(from_date=None):
     else:
         next_tuesday = from_date + timedelta(days=days_until_tuesday)
     
-    expiry_datetime = next_tuesday.replace(hour=15, minute=30, second=0, microsecond=0)
-    return expiry_datetime
+    return next_tuesday
 
 def get_monthly_expiry(from_date=None):
     """
     Calculate monthly expiry (last TUESDAY of month)
-    ⚠️ CHANGED SINCE SEPTEMBER 2024
-    NIFTY monthly futures now expire on LAST TUESDAY (not Thursday)
+    Changed since September 2024
     """
     if from_date is None:
         from_date = datetime.now(IST)
     
-    # Go to next month
+    # Get next month first day
     if from_date.month == 12:
         next_month = from_date.replace(year=from_date.year + 1, month=1, day=1)
     else:
@@ -82,7 +81,7 @@ def get_monthly_expiry(from_date=None):
     # Last day of current month
     last_day = next_month - timedelta(days=1)
     
-    # Find last TUESDAY (changed from Thursday)
+    # Find last Tuesday
     while last_day.weekday() != 1:  # Tuesday = 1
         last_day -= timedelta(days=1)
     
@@ -94,31 +93,26 @@ def get_monthly_expiry(from_date=None):
             next_next_month = next_month.replace(month=next_month.month + 1, day=1)
         
         last_day = next_next_month - timedelta(days=1)
-        while last_day.weekday() != 1:  # Tuesday = 1
+        while last_day.weekday() != 1:
             last_day -= timedelta(days=1)
     
-    return last_day.replace(hour=15, minute=30, second=0, microsecond=0)
+    return last_day
 
 # ==================== INSTRUMENTS FETCHER ====================
 class InstrumentsFetcher:
-    """Download and find NIFTY50 monthly futures + weekly options"""
+    """Find NIFTY50 monthly futures instrument"""
     
     def __init__(self):
         self.instruments = []
         self.monthly_future = None
-        self.weekly_options = {
-            'atm_strike': None,
-            'strikes': {}  # Will store CE and PE for 5 strikes
-        }
-        self.spot_price = None
     
     async def download_instruments(self):
         """Download Upstox instruments JSON"""
-        logger.info("📥 Downloading Upstox instruments...")
+        logger.info("📥 Downloading instruments...")
         
         async with aiohttp.ClientSession() as session:
             try:
-                async with session.get(INSTRUMENTS_JSON_URL) as resp:
+                async with session.get(INSTRUMENTS_JSON_URL, timeout=30) as resp:
                     if resp.status == 200:
                         compressed = await resp.read()
                         decompressed = gzip.decompress(compressed)
@@ -132,45 +126,9 @@ class InstrumentsFetcher:
                 logger.error(f"💥 Download failed: {e}")
                 return False
     
-    async def get_spot_price(self):
-        """Get NIFTY50 spot price to calculate ATM strike"""
-        logger.info("🔍 Fetching NIFTY50 spot price...")
-        
-        headers = {
-            "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
-            "Accept": "application/json"
-        }
-        
-        # NIFTY50 index instrument key
-        nifty_index_key = "NSE_INDEX|Nifty 50"
-        enc_key = urllib.parse.quote(nifty_index_key)
-        
-        url = f"https://api.upstox.com/v2/market-quote/quotes?symbol={enc_key}"
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get('status') == 'success':
-                            quote = data['data'][nifty_index_key]
-                            self.spot_price = quote['last_price']
-                            logger.info(f"✅ NIFTY50 Spot: ₹{self.spot_price:.2f}")
-                            return True
-                    else:
-                        logger.error(f"❌ Failed to fetch spot price: {resp.status}")
-                        # Fallback: use 24000 as default
-                        self.spot_price = 24000.0
-                        logger.warning(f"⚠️ Using fallback spot price: ₹{self.spot_price}")
-                        return True
-            except Exception as e:
-                logger.error(f"💥 Error fetching spot: {e}")
-                self.spot_price = 24000.0
-                return True
-    
     def find_monthly_future(self):
-        """Find NIFTY50 monthly futures (last Thursday expiry)"""
-        logger.info("🔍 Finding NIFTY50 monthly futures...")
+        """Find NIFTY monthly futures"""
+        logger.info("🔍 Finding NIFTY monthly futures...")
         
         target_expiry = get_monthly_expiry()
         target_date = target_expiry.date()
@@ -197,145 +155,65 @@ class InstrumentsFetcher:
                     'instrument_key': instrument.get('instrument_key'),
                     'trading_symbol': instrument.get('trading_symbol'),
                     'expiry': expiry_dt.strftime('%d-%b-%Y'),
-                    'expiry_timestamp': expiry_ms
+                    'expiry_date': target_date.strftime('%Y-%m-%d')
                 }
-                logger.info(f"✅ Monthly Future: {self.monthly_future['trading_symbol']}")
-                logger.info(f"   Expiry: {self.monthly_future['expiry']}")
+                logger.info(f"✅ Found: {self.monthly_future['trading_symbol']}")
+                logger.info(f"   Key: {self.monthly_future['instrument_key']}")
                 return True
         
-        logger.error(f"❌ No monthly future found for {target_date}")
+        logger.error(f"❌ No monthly future found")
         return False
     
-    def find_weekly_options(self):
-        """Find NIFTY50 weekly options (5 strikes around ATM)"""
-        logger.info("🔍 Finding NIFTY50 weekly options...")
-        
-        target_expiry = get_next_tuesday_expiry()
-        target_date = target_expiry.date()
-        
-        logger.info(f"🎯 Target Weekly Expiry: {target_date.strftime('%d-%b-%Y')} (Tuesday)")
-        
-        # Calculate ATM strike (nearest 50 multiple)
-        atm_strike = round(self.spot_price / 50) * 50
-        self.weekly_options['atm_strike'] = atm_strike
-        
-        # 5 strikes: ATM-100, ATM-50, ATM, ATM+50, ATM+100
-        target_strikes = [
-            atm_strike - 100,
-            atm_strike - 50,
-            atm_strike,
-            atm_strike + 50,
-            atm_strike + 100
-        ]
-        
-        logger.info(f"🎯 ATM Strike: {atm_strike} (Spot: ₹{self.spot_price:.2f})")
-        logger.info(f"🎯 Target Strikes: {target_strikes}")
-        
-        # Search for options
-        for instrument in self.instruments:
-            if instrument.get('segment') != 'NSE_FO':
-                continue
-            if instrument.get('instrument_type') not in ['CE', 'PE']:
-                continue
-            if instrument.get('name') != 'NIFTY':
-                continue
-            
-            expiry_ms = instrument.get('expiry', 0)
-            if not expiry_ms:
-                continue
-            
-            expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=IST)
-            expiry_date = expiry_dt.date()
-            
-            if expiry_date != target_date:
-                continue
-            
-            strike = instrument.get('strike')
-            if strike not in target_strikes:
-                continue
-            
-            option_type = instrument.get('instrument_type')  # CE or PE
-            
-            if strike not in self.weekly_options['strikes']:
-                self.weekly_options['strikes'][strike] = {}
-            
-            self.weekly_options['strikes'][strike][option_type] = {
-                'instrument_key': instrument.get('instrument_key'),
-                'trading_symbol': instrument.get('trading_symbol'),
-                'strike': strike,
-                'option_type': option_type,
-                'expiry': expiry_dt.strftime('%d-%b-%Y')
-            }
-        
-        found_count = len(self.weekly_options['strikes'])
-        logger.info(f"✅ Found options for {found_count} strikes:")
-        
-        for strike in sorted(self.weekly_options['strikes'].keys()):
-            ce = self.weekly_options['strikes'][strike].get('CE', {}).get('trading_symbol', 'N/A')
-            pe = self.weekly_options['strikes'][strike].get('PE', {}).get('trading_symbol', 'N/A')
-            atm_marker = " ← ATM" if strike == atm_strike else ""
-            logger.info(f"   {strike}: CE={ce}, PE={pe}{atm_marker}")
-        
-        return found_count == 5
-    
     async def initialize(self):
-        """Download and parse instruments"""
+        """Initialize"""
         success = await self.download_instruments()
         if not success:
             return False
         
-        await self.get_spot_price()
-        
-        if not self.find_monthly_future():
-            return False
-        
-        if not self.find_weekly_options():
-            logger.warning("⚠️ Could not find all 5 option strikes")
-        
-        return True
+        return self.find_monthly_future()
 
 # ==================== DATA FETCHER ====================
 class DataFetcher:
-    """Fetch futures candles + option chain data"""
+    """Fetch futures candles + option chain"""
     
-    def __init__(self, instruments_info):
+    def __init__(self, monthly_future):
         self.headers = {
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
-        self.monthly_future = instruments_info.monthly_future
-        self.weekly_options = instruments_info.weekly_options
-        self.spot_price = instruments_info.spot_price
+        self.monthly_future = monthly_future
     
     async def fetch_futures_candles(self) -> dict:
-        """Fetch 500 candles from monthly futures (INTRADAY API)"""
+        """Fetch intraday candles for monthly futures"""
         instrument_key = self.monthly_future['instrument_key']
         
         async with aiohttp.ClientSession() as session:
             enc_key = urllib.parse.quote(instrument_key)
             url = f"https://api.upstox.com/v2/historical-candle/intraday/{enc_key}/1minute"
             
-            logger.info(f"📊 Fetching futures candles: {instrument_key}")
+            logger.info(f"📊 Fetching futures candles...")
+            logger.info(f"   URL: {url}")
             
             try:
-                async with session.get(url, headers=self.headers) as resp:
+                async with session.get(url, headers=self.headers, timeout=30) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         
-                        if data.get('status') == 'success' and 'data' in data:
-                            raw_candles = data['data'].get('candles', [])
+                        if data.get('status') == 'success':
+                            raw_candles = data.get('data', {}).get('candles', [])
                             
                             if not raw_candles:
                                 logger.warning("⚠️ No candles available")
                                 return None
                             
-                            # Take last 500 (or all if less)
-                            last_500 = raw_candles[:500]
+                            # Take up to 500 candles
+                            candles_to_take = min(500, len(raw_candles))
+                            selected = raw_candles[:candles_to_take]
                             
                             parsed = []
                             total_vol = 0
                             
-                            for c in last_500:
+                            for c in selected:
                                 candle = {
                                     "timestamp": c[0],
                                     "open": float(c[1]),
@@ -348,93 +226,168 @@ class DataFetcher:
                                 parsed.append(candle)
                                 total_vol += candle['volume']
                             
-                            logger.info(f"✅ Fetched {len(parsed)} candles | Total Vol: {total_vol:,}")
+                            logger.info(f"✅ Fetched {len(parsed)} candles | Vol: {total_vol:,}")
                             
                             return {
                                 "candles": parsed,
                                 "total_volume": total_vol,
                                 "candle_count": len(parsed)
                             }
+                        else:
+                            logger.error(f"❌ API error: {data}")
+                            return None
                     
-                    logger.error(f"❌ HTTP {resp.status}")
-                    return None
+                    elif resp.status == 401:
+                        logger.error("❌ Invalid access token!")
+                        return None
+                    
+                    else:
+                        error_text = await resp.text()
+                        logger.error(f"❌ HTTP {resp.status}")
+                        logger.error(f"   Response: {error_text[:500]}")
+                        return None
             
+            except asyncio.TimeoutError:
+                logger.error("❌ Request timeout")
+                return None
             except Exception as e:
-                logger.error(f"💥 Error fetching candles: {e}")
+                logger.error(f"💥 Error: {e}")
                 return None
     
-    async def fetch_option_chain(self) -> dict:
-        """Fetch option chain data for 5 strikes"""
-        logger.info("📈 Fetching option chain data...")
-        
-        option_data = {
-            'atm_strike': self.weekly_options['atm_strike'],
-            'spot_price': self.spot_price,
-            'strikes': {}
-        }
-        
-        # Collect all instrument keys
-        instrument_keys = []
-        for strike, options in self.weekly_options['strikes'].items():
-            for option_type in ['CE', 'PE']:
-                if option_type in options:
-                    instrument_keys.append(options[option_type]['instrument_key'])
-        
-        # Batch fetch quotes (Upstox allows multiple symbols)
-        if not instrument_keys:
-            logger.error("❌ No option instruments found")
-            return option_data
-        
-        # Build query string
-        symbols_param = ','.join([urllib.parse.quote(key) for key in instrument_keys])
-        url = f"https://api.upstox.com/v2/market-quote/quotes?symbol={symbols_param}"
-        
+    async def fetch_spot_price(self) -> float:
+        """Get NIFTY50 spot price"""
         async with aiohttp.ClientSession() as session:
+            enc_key = urllib.parse.quote(NIFTY_INDEX_KEY)
+            url = f"https://api.upstox.com/v2/market-quote/quotes?symbol={enc_key}"
+            
             try:
-                async with session.get(url, headers=self.headers) as resp:
+                async with session.get(url, headers=self.headers, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get('status') == 'success':
+                            quote = data['data'][NIFTY_INDEX_KEY]
+                            spot = quote['last_price']
+                            logger.info(f"✅ NIFTY Spot: ₹{spot:.2f}")
+                            return spot
+                    
+                    logger.warning("⚠️ Using fallback spot: 24000")
+                    return 24000.0
+            
+            except Exception as e:
+                logger.warning(f"⚠️ Spot fetch error: {e}, using 24000")
+                return 24000.0
+    
+    async def fetch_option_chain(self) -> dict:
+        """
+        Fetch option chain using Upstox Option Chain API
+        This returns complete option chain data for given expiry
+        """
+        logger.info("📈 Fetching option chain...")
+        
+        # Get spot price first
+        spot_price = await self.fetch_spot_price()
+        
+        # Calculate ATM strike (nearest 50 multiple)
+        atm_strike = round(spot_price / 50) * 50
+        
+        # Get next Tuesday expiry
+        next_tuesday = get_next_tuesday_expiry()
+        expiry_date = next_tuesday.strftime('%Y-%m-%d')
+        
+        logger.info(f"🎯 Target Weekly Expiry: {expiry_date} (Tuesday)")
+        logger.info(f"🎯 ATM Strike: {atm_strike} (Spot: ₹{spot_price:.2f})")
+        
+        # Option chain API
+        async with aiohttp.ClientSession() as session:
+            enc_key = urllib.parse.quote(NIFTY_INDEX_KEY)
+            url = f"https://api.upstox.com/v2/option/chain?instrument_key={enc_key}&expiry_date={expiry_date}"
+            
+            logger.info(f"   URL: {url}")
+            
+            try:
+                async with session.get(url, headers=self.headers, timeout=30) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         
                         if data.get('status') == 'success':
-                            quotes = data.get('data', {})
+                            chain_data = data.get('data', [])
                             
-                            # Parse quotes
-                            for strike, options in self.weekly_options['strikes'].items():
-                                option_data['strikes'][strike] = {}
+                            if not chain_data:
+                                logger.error("❌ No option chain data")
+                                return None
+                            
+                            logger.info(f"✅ Got option chain with {len(chain_data)} strikes")
+                            
+                            # Filter 5 strikes around ATM
+                            target_strikes = [
+                                atm_strike - 100,
+                                atm_strike - 50,
+                                atm_strike,
+                                atm_strike + 50,
+                                atm_strike + 100
+                            ]
+                            
+                            result = {
+                                'atm_strike': atm_strike,
+                                'spot_price': spot_price,
+                                'expiry': expiry_date,
+                                'strikes': {}
+                            }
+                            
+                            for item in chain_data:
+                                strike = item.get('strike_price')
                                 
-                                for option_type in ['CE', 'PE']:
-                                    if option_type not in options:
-                                        continue
-                                    
-                                    inst_key = options[option_type]['instrument_key']
-                                    
-                                    if inst_key in quotes:
-                                        quote = quotes[inst_key]
-                                        
-                                        option_data['strikes'][strike][option_type] = {
-                                            'symbol': options[option_type]['trading_symbol'],
-                                            'ltp': quote.get('last_price', 0),
-                                            'bid': quote.get('depth', {}).get('buy', [{}])[0].get('price', 0),
-                                            'ask': quote.get('depth', {}).get('sell', [{}])[0].get('price', 0),
-                                            'volume': quote.get('volume', 0),
-                                            'oi': quote.get('oi', 0),
-                                            'oi_change': quote.get('oi_day_high', 0) - quote.get('oi_day_low', 0),
-                                            'change': quote.get('net_change', 0),
-                                            'change_pct': quote.get('change_percent', 0)
-                                        }
+                                if strike not in target_strikes:
+                                    continue
+                                
+                                result['strikes'][strike] = {
+                                    'CE': self._parse_option_data(item.get('call_options', {})),
+                                    'PE': self._parse_option_data(item.get('put_options', {}))
+                                }
                             
-                            logger.info(f"✅ Fetched option chain for {len(option_data['strikes'])} strikes")
-                            return option_data
+                            found_strikes = len(result['strikes'])
+                            logger.info(f"✅ Found data for {found_strikes} strikes")
+                            
+                            for strike in sorted(result['strikes'].keys()):
+                                atm_mark = " ← ATM" if strike == atm_strike else ""
+                                logger.info(f"   Strike {strike}{atm_mark}")
+                            
+                            return result
+                        else:
+                            logger.error(f"❌ API error: {data}")
+                            return None
                     
-                    logger.error(f"❌ HTTP {resp.status}")
-                    return option_data
+                    else:
+                        error_text = await resp.text()
+                        logger.error(f"❌ HTTP {resp.status}")
+                        logger.error(f"   Response: {error_text[:500]}")
+                        return None
             
             except Exception as e:
-                logger.error(f"💥 Error fetching options: {e}")
-                return option_data
+                logger.error(f"💥 Error: {e}")
+                return None
+    
+    def _parse_option_data(self, option_data: dict) -> dict:
+        """Parse option data from chain"""
+        if not option_data:
+            return {}
+        
+        market_data = option_data.get('market_data', {})
+        
+        return {
+            'instrument_key': option_data.get('instrument_key', ''),
+            'ltp': market_data.get('ltp', 0),
+            'volume': market_data.get('volume', 0),
+            'oi': market_data.get('oi', 0),
+            'bid': market_data.get('bid_price', 0),
+            'ask': market_data.get('ask_price', 0),
+            'change': market_data.get('net_change', 0),
+            'prev_oi': market_data.get('prev_oi', 0),
+            'oi_change': market_data.get('oi', 0) - market_data.get('prev_oi', 0)
+        }
     
     async def fetch_all_data(self) -> dict:
-        """Fetch both futures candles and option chain"""
+        """Fetch both futures and options"""
         logger.info("\n" + "="*60)
         logger.info("📊 FETCHING ALL DATA")
         logger.info("="*60)
@@ -443,7 +396,7 @@ class DataFetcher:
         futures_data = await self.fetch_futures_candles()
         
         # Small delay
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
         
         # Fetch options
         options_data = await self.fetch_option_chain()
@@ -457,48 +410,45 @@ class DataFetcher:
                 "data": futures_data
             },
             "weekly_options": {
-                "expiry": next(iter(self.weekly_options['strikes'].values())).get('CE', {}).get('expiry', 'N/A'),
                 "data": options_data
             }
         }
 
 # ==================== TELEGRAM SENDER ====================
 class TelegramSender:
-    """Send comprehensive data to Telegram"""
+    """Send data to Telegram"""
     
     def __init__(self):
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
     
     async def send_data(self, data: dict):
-        """Send summary + detailed JSON"""
+        """Send summary + JSON"""
         
         futures = data['monthly_future']['data']
         options = data['weekly_options']['data']
         
-        # Check if we have data
         if not futures or not options:
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text="❌ Failed to fetch complete data"
+                text="❌ Failed to fetch data"
             )
             return
         
-        # Build summary
         latest_candle = futures['candles'][0] if futures['candles'] else None
         
         summary = f"""
-🚀 NIFTY50 HYBRID DATA
+🚀 NIFTY50 DATA
 
 ⏰ {data['fetch_time']}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-📊 MONTHLY FUTURES DATA
+📊 MONTHLY FUTURES
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-📈 Symbol: {data['monthly_future']['symbol']}
+📈 {data['monthly_future']['symbol']}
 📅 Expiry: {data['monthly_future']['expiry']}
 📦 Candles: {futures['candle_count']}
-📊 Total Volume: {futures['total_volume']:,}
+📊 Volume: {futures['total_volume']:,}
 """
         
         if latest_candle:
@@ -507,38 +457,35 @@ class TelegramSender:
 💰 Latest: ₹{latest_candle['close']:.2f}
 📈 High: ₹{latest_candle['high']:.2f}
 📉 Low: ₹{latest_candle['low']:.2f}
-🕐 Time: {latest_time.strftime('%I:%M %p')}
+🕐 {latest_time.strftime('%I:%M %p')}
 📊 OI: {latest_candle['oi']:,}
 """
         
         summary += f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━
-📈 WEEKLY OPTIONS CHAIN
+📈 WEEKLY OPTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-📅 Expiry: {data['weekly_options']['expiry']}
+📅 Expiry: {options['expiry']}
 🎯 Spot: ₹{options['spot_price']:.2f}
-🎯 ATM Strike: {options['atm_strike']}
+🎯 ATM: {options['atm_strike']}
 
 """
         
-        # Option chain table
         for strike in sorted(options['strikes'].keys()):
             strike_data = options['strikes'][strike]
-            
             ce = strike_data.get('CE', {})
             pe = strike_data.get('PE', {})
             
-            atm_marker = "← ATM" if strike == options['atm_strike'] else ""
+            atm_mark = "← ATM" if strike == options['atm_strike'] else ""
             
-            summary += f"""
-Strike: {strike} {atm_marker}
+            summary += f"""Strike {strike} {atm_mark}
   CE: ₹{ce.get('ltp', 0):.2f} | Vol: {ce.get('volume', 0):,} | OI: {ce.get('oi', 0):,}
   PE: ₹{pe.get('ltp', 0):.2f} | Vol: {pe.get('volume', 0):,} | OI: {pe.get('oi', 0):,}
 
 """
         
-        summary += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n📎 Full JSON attached"
+        summary += "━━━━━━━━━━━━━━━━━━━━━━━━\n📎 JSON attached"
         
         try:
             # Send summary
@@ -550,54 +497,49 @@ Strike: {strike} {atm_marker}
             # Send JSON
             json_str = json.dumps(data, indent=2)
             json_file = BytesIO(json_str.encode('utf-8'))
-            json_file.name = f"nifty_data_{datetime.now(IST).strftime('%H%M%S')}.json"
+            json_file.name = f"nifty_{datetime.now(IST).strftime('%H%M%S')}.json"
             
             await self.bot.send_document(
                 chat_id=TELEGRAM_CHAT_ID,
                 document=json_file,
-                caption="📊 Complete NIFTY50 Data (500 Candles + Option Chain)"
+                caption="📊 Complete Data"
             )
             
             logger.info("✅ Sent to Telegram")
         
         except Exception as e:
-            logger.error(f"❌ Telegram error: {e}")
+            logger.error(f"❌ Telegram: {e}")
 
 # ==================== MAIN ====================
 async def main():
     """Main loop"""
     
     logger.info("=" * 80)
-    logger.info("🚀 NIFTY50 HYBRID DATA BOT")
+    logger.info("🚀 NIFTY50 HYBRID BOT")
     logger.info("=" * 80)
     logger.info("")
-    logger.info("⚠️ NEW EXPIRY SCHEDULE (Since Sept 2024):")
-    logger.info("   📊 Monthly: Last Tuesday of month")
+    logger.info("⚠️ NEW EXPIRY (Sept 2024+):")
+    logger.info("   📊 Monthly: Last Tuesday")
     logger.info("   📈 Weekly: Every Tuesday")
-    logger.info("")
-    logger.info("📊 Monthly Futures: 500 candles + volume")
-    logger.info("📈 Weekly Options: 5 strikes (ATM ±2)")
     logger.info("")
     
     # Initialize
-    logger.info("📥 Initializing instruments...")
+    logger.info("📥 Initializing...")
     fetcher_init = InstrumentsFetcher()
     
     success = await fetcher_init.initialize()
     if not success:
-        logger.error("❌ Initialization failed!")
+        logger.error("❌ Init failed!")
         return
     
     logger.info("")
-    logger.info("✅ Initialization complete")
-    logger.info("")
+    logger.info("✅ Ready!")
     logger.info("⏱️ Interval: 60 seconds")
     logger.info("")
     logger.info("=" * 80)
-    logger.info("")
     
     # Create fetcher and sender
-    data_fetcher = DataFetcher(fetcher_init)
+    data_fetcher = DataFetcher(fetcher_init.monthly_future)
     sender = TelegramSender()
     
     iteration = 0
@@ -609,14 +551,14 @@ async def main():
             logger.info(f"🔄 Iteration #{iteration}")
             logger.info(f"{'='*60}\n")
             
-            # Fetch all data
+            # Fetch
             data = await data_fetcher.fetch_all_data()
             
-            # Send to Telegram
+            # Send
             await sender.send_data(data)
             
             # Wait
-            logger.info("\n⏳ Waiting 60 seconds...\n")
+            logger.info("\n⏳ Waiting 60s...\n")
             await asyncio.sleep(60)
         
         except KeyboardInterrupt:
@@ -625,6 +567,8 @@ async def main():
         
         except Exception as e:
             logger.error(f"💥 Error: {e}")
+            import traceback
+            traceback.print_exc()
             logger.info("   Retrying in 60s...")
             await asyncio.sleep(60)
 
