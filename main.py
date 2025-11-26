@@ -66,8 +66,9 @@ def get_next_tuesday_expiry(from_date=None):
 
 def get_monthly_expiry(from_date=None):
     """
-    Calculate monthly expiry (last Thursday of month)
-    NIFTY monthly futures expire on last Thursday
+    Calculate monthly expiry (last TUESDAY of month)
+    ⚠️ CHANGED SINCE SEPTEMBER 2024
+    NIFTY monthly futures now expire on LAST TUESDAY (not Thursday)
     """
     if from_date is None:
         from_date = datetime.now(IST)
@@ -81,8 +82,8 @@ def get_monthly_expiry(from_date=None):
     # Last day of current month
     last_day = next_month - timedelta(days=1)
     
-    # Find last Thursday
-    while last_day.weekday() != 3:  # Thursday = 3
+    # Find last TUESDAY (changed from Thursday)
+    while last_day.weekday() != 1:  # Tuesday = 1
         last_day -= timedelta(days=1)
     
     # If already passed, get next month
@@ -93,7 +94,7 @@ def get_monthly_expiry(from_date=None):
             next_next_month = next_month.replace(month=next_month.month + 1, day=1)
         
         last_day = next_next_month - timedelta(days=1)
-        while last_day.weekday() != 3:
+        while last_day.weekday() != 1:  # Tuesday = 1
             last_day -= timedelta(days=1)
     
     return last_day.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -174,7 +175,7 @@ class InstrumentsFetcher:
         target_expiry = get_monthly_expiry()
         target_date = target_expiry.date()
         
-        logger.info(f"🎯 Target Monthly Expiry: {target_date.strftime('%d-%b-%Y')} (Last Thursday)")
+        logger.info(f"🎯 Target Monthly Expiry: {target_date.strftime('%d-%b-%Y')} (Last Tuesday)")
         
         for instrument in self.instruments:
             if instrument.get('segment') != 'NSE_FO':
@@ -569,6 +570,10 @@ async def main():
     logger.info("=" * 80)
     logger.info("🚀 NIFTY50 HYBRID DATA BOT")
     logger.info("=" * 80)
+    logger.info("")
+    logger.info("⚠️ NEW EXPIRY SCHEDULE (Since Sept 2024):")
+    logger.info("   📊 Monthly: Last Tuesday of month")
+    logger.info("   📈 Weekly: Every Tuesday")
     logger.info("")
     logger.info("📊 Monthly Futures: 500 candles + volume")
     logger.info("📈 Weekly Options: 5 strikes (ATM ±2)")
