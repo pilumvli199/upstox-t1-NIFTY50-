@@ -23,6 +23,8 @@ import pandas as pd
 import numpy as np
 from collections import deque
 import time as time_module
+import gzip
+from io import BytesIO
 
 # Optional dependencies
 try:
@@ -61,6 +63,8 @@ NIFTY_CONFIG = {
     'expiry_day': 1,
     'expiry_type': 'weekly'
 }
+
+INSTRUMENTS_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
 ALERT_ONLY_MODE = True
 SCAN_INTERVAL = 60
@@ -175,12 +179,62 @@ def get_monthly_expiry() -> datetime:
             last_day -= timedelta(days=1)
     return last_day
 
+async def fetch_futures_instrument_key() -> Optional[str]:
+    """Download instruments JSON and find correct futures key"""
+    logger.info("📥 Downloading Upstox instruments...")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(INSTRUMENTS_JSON_URL, timeout=30) as resp:
+                if resp.status == 200:
+                    compressed = await resp.read()
+                    decompressed = gzip.decompress(compressed)
+                    instruments = json.loads(decompressed)
+                    logger.info(f"✅ Loaded {len(instruments)} instruments")
+                    
+                    # Find monthly futures
+                    target_expiry = get_monthly_expiry()
+                    target_date = target_expiry.date()
+                    
+                    logger.info(f"🎯 Looking for NIFTY futures expiry: {target_date.strftime('%d-%b-%Y')}")
+                    
+                    for instrument in instruments:
+                        if instrument.get('segment') != 'NSE_FO':
+                            continue
+                        if instrument.get('instrument_type') != 'FUT':
+                            continue
+                        if instrument.get('name') != 'NIFTY':
+                            continue
+                        
+                        expiry_ms = instrument.get('expiry', 0)
+                        if not expiry_ms:
+                            continue
+                        
+                        expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=IST)
+                        expiry_date = expiry_dt.date()
+                        
+                        if expiry_date == target_date:
+                            instrument_key = instrument.get('instrument_key')
+                            trading_symbol = instrument.get('trading_symbol')
+                            logger.info(f"✅ Found: {trading_symbol}")
+                            logger.info(f"   Key: {instrument_key}")
+                            return instrument_key
+                    
+                    logger.error("❌ No matching futures found")
+                    return None
+                else:
+                    logger.error(f"❌ HTTP {resp.status}")
+                    return None
+    except Exception as e:
+        logger.error(f"💥 Error: {e}")
+        return None
+
 def get_futures_symbol() -> str:
+    """Legacy function - kept for compatibility"""
     expiry = get_monthly_expiry()
     year_short = expiry.year % 100
     month_name = expiry.strftime('%b').upper()
     symbol = f"NSE_FO|NIFTY{year_short:02d}{month_name}FUT"
-    logger.info(f"🎯 Futures: {symbol} (Expiry: {expiry.strftime('%d-%b-%Y')})")
     return symbol
 
 def is_tradeable_time() -> bool:
@@ -279,12 +333,13 @@ class RedisBrain:
             return 0.0, 0.0
 
 class NiftyDataFeed:
-    def __init__(self):
+    def __init__(self, futures_key: str):
         self.headers = {
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
-        self.futures_symbol = get_futures_symbol()
+        self.futures_symbol = futures_key
+        logger.info(f"📊 Futures Key: {futures_key}")
     
     async def fetch_with_retry(self, url: str, session: aiohttp.ClientSession):
         for attempt in range(3):
@@ -331,16 +386,18 @@ class NiftyDataFeed:
                     if resp.status == 200:
                         data = await resp.json()
                         if data.get('status') == 'success':
-                            # ✅ CORRECT: Access key from data root level
-                            all_data = data.get('data', {})
-                            quote = all_data.get(NIFTY_CONFIG['spot_key'])
-                            if quote:
+                            # ✅ EXACT METHOD FROM YOUR WORKING CODE
+                            data_dict = data.get('data', {})
+                            if NIFTY_CONFIG['spot_key'] in data_dict:
+                                quote = data_dict[NIFTY_CONFIG['spot_key']]
                                 spot_price = quote.get('last_price', 0)
                                 logger.info(f"✅ NIFTY Spot: ₹{spot_price:.2f}")
                             else:
-                                logger.warning("⚠️ Quote not found in response")
+                                logger.warning(f"⚠️ Key '{NIFTY_CONFIG['spot_key']}' not found in response")
+                                logger.info(f"Available keys: {list(data_dict.keys())[:3]}")
                     else:
-                        logger.warning(f"⚠️ Spot API returned {resp.status}")
+                        error_text = await resp.text()
+                        logger.warning(f"⚠️ Spot API returned {resp.status}: {error_text[:200]}")
             except Exception as e:
                 logger.warning(f"⚠️ Spot fetch error: {e}")
             
@@ -527,8 +584,8 @@ class NiftyAnalyzer:
             return sum(last_3['close'] < last_3['open']) >= 2
 
 class NiftyStrikeMaster:
-    def __init__(self):
-        self.feed = NiftyDataFeed()
+    def __init__(self, futures_key: str):
+        self.feed = NiftyDataFeed(futures_key)
         self.redis = RedisBrain()
         self.analyzer = NiftyAnalyzer()
         self.telegram = None
@@ -876,12 +933,21 @@ async def main():
     logger.info("📊 Index: NIFTY 50")
     logger.info(f"🔔 Mode: {'ALERT ONLY' if ALERT_ONLY_MODE else 'LIVE TRADING'}")
     logger.info(f"⏱️ Scan Interval: {SCAN_INTERVAL} seconds")
-    logger.info("✅ FIXED: Spot price response parsing")
-    logger.info("✅ FIXED: API response structure handling")
+    logger.info("")
+    
+    # Fetch correct futures instrument key
+    logger.info("🔍 Finding correct futures instrument...")
+    futures_key = await fetch_futures_instrument_key()
+    
+    if not futures_key:
+        logger.error("❌ Could not find futures instrument!")
+        logger.error("   Check if NIFTY futures are available for current expiry")
+        return
+    
     logger.info("")
     
     try:
-        bot = NiftyStrikeMaster()
+        bot = NiftyStrikeMaster(futures_key)
         logger.info("✅ Bot initialized")
     except Exception as e:
         logger.error(f"❌ Initialization failed: {e}")
@@ -898,6 +964,7 @@ async def main():
     logger.info("   ✅ Smart Rate Limiting")
     logger.info("   ✅ Redis Memory with TTL")
     logger.info("   ✅ Duplicate Signal Filter")
+    logger.info("   ✅ Dynamic Instrument Discovery")
     logger.info("")
     logger.info("=" * 80)
     
