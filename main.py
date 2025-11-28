@@ -112,6 +112,10 @@ class Signal:
     multi_tf_confirm: bool = False
     lot_size: int = 25
     quantity: int = 1
+    atm_ce_oi: int = 0
+    atm_pe_oi: int = 0
+    atm_ce_vol: int = 0
+    atm_pe_vol: int = 0
 
 class RateLimiter:
     def __init__(self):
@@ -646,8 +650,12 @@ class NiftyStrikeMaster:
             atm_ce_15m, atm_pe_15m = self.redis.get_strike_oi_change(atm_strike, current_atm, minutes_ago=15)
             
             # Show N/A if no historical data
-            ce_display = f"{atm_ce_15m:+.1f}%" if atm_ce_15m != 0 else "N/A"
-            pe_display = f"{atm_pe_15m:+.1f}%" if atm_pe_15m != 0 else "N/A"
+            if atm_ce_15m == 0 and atm_pe_15m == 0:
+                ce_display = "N/A"
+                pe_display = "N/A"
+            else:
+                ce_display = f"{atm_ce_15m:+.1f}%"
+                pe_display = f"{atm_pe_15m:+.1f}%"
             logger.info(f"⚔️ ATM {atm_strike}: CE={ce_display} PE={pe_display}")
         else:
             atm_ce_15m, atm_pe_15m = 0, 0
@@ -676,7 +684,7 @@ class NiftyStrikeMaster:
         signal = self.generate_signal(spot, futures, vwap, vwap_distance, pcr, atr,
             ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
             atm_ce_15m, atm_pe_15m, candle_color, candle_size,
-            has_vol_spike, vol_mult, df, order_flow, max_pain_dist, gamma_zone, multi_tf, atm_strike)
+            has_vol_spike, vol_mult, df, order_flow, max_pain_dist, gamma_zone, multi_tf, atm_strike, strike_data)
         
         if signal:
             if self._can_send_signal(signal.strike):
@@ -691,7 +699,7 @@ class NiftyStrikeMaster:
                        ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
                        atm_ce_change, atm_pe_change, candle_color, candle_size,
                        has_vol_spike, vol_mult, df, order_flow, max_pain_dist,
-                       gamma_zone, multi_tf, atm_strike) -> Optional[Signal]:
+                       gamma_zone, multi_tf, atm_strike, strike_data) -> Optional[Signal]:
         
         stop_loss_points = int(atr * ATR_SL_MULTIPLIER)
         target_points = int(atr * ATR_TARGET_MULTIPLIER)
@@ -703,6 +711,13 @@ class NiftyStrikeMaster:
         
         lot_size = NIFTY_CONFIG['lot_size']
         quantity = 1
+        
+        # Get current ATM data
+        atm_data = strike_data.get(atm_strike, {})
+        atm_ce_oi = atm_data.get('ce_oi', 0)
+        atm_pe_oi = atm_data.get('pe_oi', 0)
+        atm_ce_vol = atm_data.get('ce_vol', 0)
+        atm_pe_vol = atm_data.get('pe_vol', 0)
         
         # CE BUY SIGNAL
         if ce_total_15m < -OI_THRESHOLD_MEDIUM or atm_ce_change < -ATM_OI_THRESHOLD:
@@ -721,7 +736,8 @@ class NiftyStrikeMaster:
                 "Momentum": self.analyzer.check_momentum(df, 'bullish'),
                 "Order Flow Bullish": order_flow < 1.0,
                 "Multi-TF Confirm": multi_tf,
-                "Gamma Zone": gamma_zone
+                "Gamma Zone": gamma_zone,
+                "ATM Strong Unwinding": atm_ce_change < -8.0  # ← New bonus check
             }
             passed = sum(checks.values())
             bonus_passed = sum(bonus.values())
@@ -739,7 +755,8 @@ class NiftyStrikeMaster:
                     oi_5m=ce_total_5m, oi_15m=ce_total_15m, atm_ce_change=atm_ce_change,
                     atm_pe_change=atm_pe_change, atr=atr, timestamp=datetime.now(IST),
                     order_flow_imbalance=order_flow, max_pain_distance=max_pain_dist,
-                    gamma_zone=gamma_zone, multi_tf_confirm=multi_tf, lot_size=lot_size, quantity=quantity)
+                    gamma_zone=gamma_zone, multi_tf_confirm=multi_tf, lot_size=lot_size, quantity=quantity,
+                    atm_ce_oi=atm_ce_oi, atm_pe_oi=atm_pe_oi, atm_ce_vol=atm_ce_vol, atm_pe_vol=atm_pe_vol)
         
         # PE BUY SIGNAL
         if pe_total_15m < -OI_THRESHOLD_MEDIUM or atm_pe_change < -ATM_OI_THRESHOLD:
@@ -778,7 +795,8 @@ class NiftyStrikeMaster:
                     oi_5m=pe_total_5m, oi_15m=pe_total_15m, atm_ce_change=atm_ce_change,
                     atm_pe_change=atm_pe_change, atr=atr, timestamp=datetime.now(IST),
                     order_flow_imbalance=order_flow, max_pain_distance=max_pain_dist,
-                    gamma_zone=gamma_zone, multi_tf_confirm=multi_tf, lot_size=lot_size, quantity=quantity)
+                    gamma_zone=gamma_zone, multi_tf_confirm=multi_tf, lot_size=lot_size, quantity=quantity,
+                    atm_ce_oi=atm_ce_oi, atm_pe_oi=atm_pe_oi, atm_ce_vol=atm_ce_vol, atm_pe_vol=atm_pe_vol)
         return None
     
     async def send_alert(self, s: Signal):
@@ -846,8 +864,8 @@ Total OI Change:
   15m: CE={s.oi_15m:+.1f}% | PE={-s.oi_15m:+.1f}%
 
 ATM Strike {s.strike}:
-  CE: {s.atm_ce_change:+.1f}%
-  PE: {s.atm_pe_change:+.1f}%
+  CE: {s.atm_ce_change:+.1f}% {"(N/A)" if s.atm_ce_change == 0 else ""}
+  PE: {s.atm_pe_change:+.1f}% {"(N/A)" if s.atm_pe_change == 0 else ""}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 ADVANCED METRICS
