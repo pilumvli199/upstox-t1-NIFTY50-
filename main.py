@@ -45,7 +45,7 @@ except ImportError:
 IST = pytz.timezone('Asia/Kolkata')
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.DEBUG  # Changed from INFO to DEBUG for more details
 )
 logger = logging.getLogger("NIFTY-Pro")
 
@@ -252,6 +252,7 @@ class RedisBrain:
         self.client = None
         self.memory = {}
         self.memory_timestamps = {}
+        self.startup_time = datetime.now(IST)
         if REDIS_AVAILABLE:
             try:
                 self.client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -261,6 +262,11 @@ class RedisBrain:
                 self.client = None
         if not self.client:
             logger.info("💾 RAM-only mode")
+    
+    def is_warmed_up(self, minutes: int = 15) -> bool:
+        """Check if enough time has passed to have historical data"""
+        elapsed = (datetime.now(IST) - self.startup_time).total_seconds() / 60
+        return elapsed >= minutes
     
     def _cleanup_old_memory(self):
         if self.client:
@@ -293,13 +299,15 @@ class RedisBrain:
         key = f"nifty:strike:{strike}:{timestamp.strftime('%H%M')}"
         past_data_str = self.client.get(key) if self.client else self.memory.get(key)
         if not past_data_str:
+            logger.debug(f"📊 No historical data for {strike} @ {minutes_ago}m ago (key: {key})")
             return 0.0, 0.0
         try:
             past = json.loads(past_data_str)
             ce_chg = ((current_data['ce_oi'] - past['ce_oi']) / past['ce_oi'] * 100 if past['ce_oi'] > 0 else 0)
             pe_chg = ((current_data['pe_oi'] - past['pe_oi']) / past['pe_oi'] * 100 if past['pe_oi'] > 0 else 0)
             return ce_chg, pe_chg
-        except:
+        except Exception as e:
+            logger.debug(f"⚠️ Error parsing OI data: {e}")
             return 0.0, 0.0
     
     def save_total_oi_snapshot(self, ce_total: int, pe_total: int):
@@ -636,15 +644,25 @@ class NiftyStrikeMaster:
         if atm_strike in strike_data:
             current_atm = strike_data[atm_strike]
             atm_ce_15m, atm_pe_15m = self.redis.get_strike_oi_change(atm_strike, current_atm, minutes_ago=15)
-            logger.info(f"⚔️ ATM {atm_strike}: CE={atm_ce_15m:+.1f}% PE={atm_pe_15m:+.1f}%")
+            
+            # Show N/A if no historical data
+            ce_display = f"{atm_ce_15m:+.1f}%" if atm_ce_15m != 0 else "N/A"
+            pe_display = f"{atm_pe_15m:+.1f}%" if atm_pe_15m != 0 else "N/A"
+            logger.info(f"⚔️ ATM {atm_strike}: CE={ce_display} PE={pe_display}")
         else:
             atm_ce_15m, atm_pe_15m = 0, 0
+            logger.info(f"⚠️ ATM strike {atm_strike} data not available")
         
         total_ce = sum(d['ce_oi'] for d in strike_data.values())
         total_pe = sum(d['pe_oi'] for d in strike_data.values())
         ce_total_15m, pe_total_15m = self.redis.get_total_oi_change(total_ce, total_pe, minutes_ago=15)
         ce_total_5m, pe_total_5m = self.redis.get_total_oi_change(total_ce, total_pe, minutes_ago=5)
         multi_tf = self.analyzer.check_multi_tf_confirmation(ce_total_5m, ce_total_15m, pe_total_5m, pe_total_15m)
+        
+        # Check if system has warmed up
+        if not self.redis.is_warmed_up(15):
+            elapsed = (datetime.now(IST) - self.redis.startup_time).total_seconds() / 60
+            logger.warning(f"⏳ Warmup: {elapsed:.0f}/15 min - OI changes may be incomplete")
         
         for strike, data in strike_data.items():
             self.redis.save_strike_snapshot(strike, data)
