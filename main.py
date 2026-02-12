@@ -1,22 +1,27 @@
 """
-🚀 NIFTY OPTIONS BOT - PRODUCTION READY (FULLY FIXED v3.0)
-==========================================================
-Version: 3.0 (Based on Actual Upstox API - All Bugs Fixed!)
+🚀 NIFTY OPTIONS BOT - PRODUCTION READY v4.0
+==============================================
+Version: 4.0 (CRITICAL FIX - OI Logic Corrected!)
 Author: Built for Indian Options Trading
 Last Updated: Feb 2026
 
-✅ CRITICAL FIXES IN v3.0:
+✅ CRITICAL FIXES IN v4.0:
+- 🔥 FIXED AI OI INTERPRETATION (was inverted!)
+- ✅ RE-ENABLED NIFTY 50 Spot Candles (1-min intraday)
 - Auto-fetches ACTUAL available expiries from Upstox API
-- No hardcoded expiry calculation - uses real data from Upstox
 - Spot price from option chain (no separate call)
-- NIFTY Futures for candles (Index data unreliable)
-- Detailed error logging for debugging
-- All previous fixes retained
+- Detailed OI logic explanation in AI prompt
 
-🎯 TESTED AGAINST:
-- Official Upstox v2 API Documentation
-- Upstox Community Forum Issues
-- Real-world production scenarios
+⚠️ OI INTERPRETATION (CRITICAL):
+- OI = Option Writers (Sellers), NOT Buyers!
+- PUT OI Increase = Support Building = BULLISH
+- CALL OI Increase = Resistance Building = BEARISH
+- Previous versions had this BACKWARDS!
+
+🎯 STRATEGY:
+- Primary: OI Changes (15-min)
+- Secondary: Candlestick Patterns (5-min)
+- AI: DeepSeek V3.2 with corrected OI logic
 """
 
 import asyncio
@@ -209,60 +214,18 @@ class UpstoxClient:
         
         return await self._request('get', url, params=params)
     
-    async def get_nifty_futures_key(self) -> Optional[str]:
-        """
-        ✅ IMPROVED: Dynamically construct NIFTY futures key for candles
-        Note: Using futures because NSE_INDEX historical candles are unreliable
-        """
-        try:
-            now = datetime.now(IST)
-            
-            # Get current or next month expiry
-            year = now.year % 100  # Last 2 digits
-            month = now.month
-            
-            # If we're past 25th, move to next month
-            if now.day > 25:
-                month += 1
-                if month > 12:
-                    month = 1
-                    year += 1
-            
-            # Month abbreviations
-            month_abbr = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 
-                          'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'][month - 1]
-            
-            # Construct futures key
-            # Format: NSE_FO|NIFTYYYMMMFUT
-            key = f"NSE_FO|NIFTY{year}{month_abbr}FUT"
-            
-            logger.info(f"📈 Using futures key for candles: {key}")
-            return key
-        
-        except Exception as e:
-            logger.error(f"❌ Error constructing futures key: {e}")
-            # Fallback
-            now = datetime.now(IST)
-            year = now.year % 100
-            month_abbr = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 
-                          'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'][now.month - 1]
-            fallback_key = f"NSE_FO|NIFTY{year}{month_abbr}FUT"
-            logger.warning(f"⚠️ Using fallback futures key: {fallback_key}")
-            return fallback_key
-    
     async def get_1min_candles(self) -> pd.DataFrame:
         """
-        ✅ FIXED: Get 1-min candles using NIFTY FUTURES
-        Reason: NSE_INDEX candles often return empty (known Upstox limitation)
+        ✅ FIXED: Get NIFTY 50 spot 1-min candles
+        Using NSE_INDEX|Nifty 50 directly (spot, not futures)
         """
-        instrument_key = await self.get_nifty_futures_key()
+        # ✅ Use SPOT index, not futures!
+        instrument_key = "NSE_INDEX|Nifty 50"
         
-        if not instrument_key:
-            logger.warning("⚠️ Could not determine futures key")
-            return pd.DataFrame()
-        
-        # ✅ Using intraday API (no date params needed for current day)
+        # v2 API intraday endpoint
         url = f"{UPSTOX_API_URL}/historical-candle/intraday/{instrument_key}/1minute"
+        
+        logger.info(f"📈 Fetching NIFTY 50 spot candles...")
         
         data = await self._request('get', url)
         
@@ -273,7 +236,8 @@ class UpstoxClient:
         candles = data.get("data", {}).get("candles", [])
         
         if not candles or len(candles) == 0:
-            logger.warning("⚠️ No candle data available from Upstox")
+            logger.warning("⚠️ Empty candle data from Upstox (known issue)")
+            logger.info("💡 Continuing with OI-only analysis")
             return pd.DataFrame()
         
         # Convert to DataFrame
@@ -300,7 +264,7 @@ class UpstoxClient:
         df.set_index('timestamp', inplace=True)
         df.sort_index(inplace=True)
         
-        logger.info(f"📊 Fetched {len(df)} 1-min candles from NIFTY futures")
+        logger.info(f"✅ Fetched {len(df)} 1-min NIFTY 50 spot candles")
         return df
     
     async def get_available_expiries(self) -> List[str]:
@@ -630,6 +594,30 @@ ATM Strike: {atm}
 ANALYZE & DECIDE:
 Based PRIMARILY on 15-min OI changes, should I enter a trade NOW?
 
+🚨 CRITICAL OI INTERPRETATION RULES (READ CAREFULLY):
+═══════════════════════════════════════════════════════
+
+OI = Open Interest = OPTION WRITERS/SELLERS (NOT Buyers!)
+
+✅ CORRECT INTERPRETATION:
+• CALL OI INCREASE = Call Writers Adding Positions = RESISTANCE = Bears Fighting Bulls = BEARISH → Consider BUY_PUT
+• PUT OI INCREASE = Put Writers Adding Positions = SUPPORT = Bulls Fighting Bears = BULLISH → Consider BUY_CALL
+• CALL OI DECREASE = Call Writers Covering = Resistance Breaking = BULLISH → Consider BUY_CALL  
+• PUT OI DECREASE = Put Writers Covering = Support Breaking = BEARISH → Consider BUY_PUT
+
+❌ COMMON MISTAKE (DON'T DO THIS):
+• DO NOT think "Put OI increase = People buying puts = Bearish"
+• This is WRONG! OI is SELLERS, not buyers!
+
+EXAMPLE SCENARIOS:
+1. If PUT OI +10% and CALL OI -5%:
+   → Put writers building support + Call resistance breaking
+   → This is BULLISH → Consider BUY_CALL
+
+2. If CALL OI +10% and PUT OI -5%:
+   → Call writers building resistance + Put support breaking  
+   → This is BEARISH → Consider BUY_PUT
+
 RESPOND IN JSON:
 {{
     "signal": "BUY_CALL" | "BUY_PUT" | "WAIT",
@@ -638,18 +626,18 @@ RESPOND IN JSON:
     "stop_loss": strike_price,
     "target": strike_price,
     "oi_reasoning": [
-        "Key OI observation 1",
-        "Key OI observation 2"
+        "Explain OI changes and what they mean",
+        "Are writers building support or resistance?",
+        "Is this bullish or bearish?"
     ],
-    "candle_confirmation": "Does price action confirm OI signal?",
+    "candle_confirmation": "Does price action confirm OI signal? (if available)",
     "entry_timing": "Should I enter NOW or wait?"
 }}
 
-CRITICAL RULES:
+SIGNAL STRENGTH:
 - OI change >10% in 15min = Strong signal
 - OI change >15% in 15min = Very strong signal
-- Candle must confirm OI direction (if available)
-- If conflicting signals → WAIT
+- Conflicting OI signals → WAIT
 - Only trade clear setups (confidence >7)
 
 ONLY output valid JSON, no extra text."""
@@ -892,10 +880,10 @@ class NiftyOptionsBot:
         
         logger.info("🚨 Strong OI signal detected! Proceeding to AI analysis...")
         
-        # Fetch candles
+        # Fetch 1-min candles (NIFTY 50 spot)
         candles_1min = await self.upstox.get_1min_candles()
         
-        # Resample to 5-min
+        # Resample to 5-min (if we got data)
         if not candles_1min.empty and len(candles_1min) >= 5:
             try:
                 candles_5min = candles_1min.resample('5min').agg({
@@ -906,14 +894,14 @@ class NiftyOptionsBot:
                     'volume': 'sum'
                 }).dropna()
                 
-                logger.info(f"📈 Processed {len(candles_5min)} 5-min candles")
+                logger.info(f"📊 Resampled to {len(candles_5min)} 5-min candles")
             except Exception as e:
                 logger.warning(f"⚠️ Candle resampling error: {e}")
                 candles_5min = pd.DataFrame()
         else:
             candles_5min = pd.DataFrame()
             if candles_1min.empty:
-                logger.warning("⚠️ No candle data from API")
+                logger.info("📈 No candle data - using OI-only analysis")
         
         # Detect patterns
         patterns = self.pattern_detector.detect(candles_5min) if not candles_5min.empty else []
@@ -981,7 +969,7 @@ class NiftyOptionsBot:
     async def run(self):
         """Main bot loop"""
         logger.info("\n" + "="*60)
-        logger.info("🚀 NIFTY OPTIONS BOT v3.0 - FULLY FIXED")
+        logger.info("🚀 NIFTY OPTIONS BOT v4.0 - OI LOGIC FIXED!")
         logger.info("="*60)
         logger.info(f"📅 {datetime.now(IST).strftime('%d-%b-%Y %A')}")
         logger.info(f"🕐 {datetime.now(IST).strftime('%H:%M:%S IST')}")
@@ -989,10 +977,11 @@ class NiftyOptionsBot:
         logger.info(f"📊 Symbol: {SYMBOL}")
         logger.info(f"🎯 ATM Range: ±{ATM_RANGE} strikes")
         logger.info(f"💾 Cache: {CACHE_SIZE} snapshots (30 min)")
-        logger.info(f"🤖 AI: DeepSeek V3.2-Exp")
-        logger.info(f"📈 Candles: NIFTY Futures (reliable)")
+        logger.info(f"🤖 AI: DeepSeek V3.2 (with CORRECT OI logic)")
+        logger.info(f"📈 Candles: NIFTY 50 Spot (1-min → 5-min)")
         logger.info(f"💰 Spot: From Option Chain")
         logger.info(f"📅 Expiry: Auto-fetched from Upstox API")
+        logger.info(f"🔥 OI Logic: PUT↑=BULLISH, CALL↑=BEARISH")
         logger.info("="*60 + "\n")
         
         await self.upstox.init()
@@ -1028,7 +1017,7 @@ class NiftyOptionsBot:
 # ======================== KOYEB HTTP WRAPPER ========================
 async def health_check(request):
     """Health check endpoint"""
-    return aiohttp.web.Response(text="✅ NIFTY Bot v3.0 Running! (Expiry Auto-Fetch Fixed)")
+    return aiohttp.web.Response(text="✅ NIFTY Bot v4.0 Running! (OI Logic FIXED)")
 
 
 async def start_bot_background(app):
@@ -1055,16 +1044,23 @@ if __name__ == "__main__":
     
     print(f"""
 ╔══════════════════════════════════════════════════════╗
-║   🚀 NIFTY OPTIONS BOT v3.0                         ║
-║   Fully Fixed - Auto Expiry Fetch from Upstox      ║
+║   🚀 NIFTY OPTIONS BOT v4.0                         ║
+║   CRITICAL FIX - OI Logic Corrected!                ║
 ╚══════════════════════════════════════════════════════╝
 
-✅ ALL CRITICAL FIXES APPLIED:
-  • Auto-fetch available expiries from Upstox API
-  • Spot price from option chain response
-  • NIFTY Futures for candles (reliable)
-  • Detailed error logging
-  • All edge cases handled
+🔥 CRITICAL FIX:
+  • AI OI interpretation was INVERTED - NOW FIXED!
+  • PUT OI ↑ = Support = BULLISH (not bearish!)
+  • CALL OI ↑ = Resistance = BEARISH (not bullish!)
+
+✅ OTHER FIXES:
+  • Auto-fetch expiries from Upstox API
+  • Spot price from option chain
+  • Candles: NIFTY 50 Spot (1-min intraday)
+  • OI + Candlestick combined analysis
+
+⚠️ PREVIOUS SIGNALS WERE BACKWARDS!
+  Ignore any trades from v3.0 or earlier!
 
 Starting HTTP server on port {port}...
 Bot will run in background.
